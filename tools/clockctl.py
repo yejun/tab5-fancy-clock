@@ -3,7 +3,8 @@
 
   clockctl.py log [seconds]      print the device log
   clockctl.py time               set the RTC to this computer's local time
-  clockctl.py shot [out.png]     grab a screenshot
+  clockctl.py shot [out.png]     grab a screenshot (LVGL's view; a name ending in _fb.png reads the panel's
+                                 frame buffer instead, i.e. what is really on the glass)
   clockctl.py cmd <C|M|S>        next theme / toggle 12-24h / status
 """
 import sys, time, datetime
@@ -37,7 +38,7 @@ def send(s, line, wait=1.0):
 
 def shot(s, path):
     s.reset_input_buffer()
-    s.write(b"P\n")
+    s.write(b"F\n" if path.endswith("_fb.png") else b"P\n")
     buf = b""
     t0 = time.time()
     while b"SNAP " not in buf or buf.find(b"\n", buf.find(b"SNAP ")) < 0:

@@ -1,8 +1,12 @@
 // Fancy Clock for the M5Stack Tab5 (ESP32-P4, 1280x720 MIPI-DSI)
 //
 //  * LVGL 9 does all the drawing, M5GFX/M5Unified provide the display, touch, RTC and battery.
-//  * The heavy, static artwork (gradient, glow, dial, ticks, numerals, calendar card) is rendered once
-//    into an LVGL snapshot image, so the 30 fps sweeping second hand only has to blit + redraw hands.
+//  * The heavy, static artwork (gradients, glows, bokeh, guilloche dial, ticks, numerals, frosted calendar card) is
+//    rendered once per theme into an image.  Per frame (~15 fps) only small rectangles hugging the moving hands are
+//    redrawn; hands, hub and glows are drawn by a custom draw callback using pre-computed ARGB sprites instead of
+//    LVGL's (expensive) blurred box shadows.
+//  * The rotated copy into the panel's frame buffer is done by the P4's PPA (pixel processing accelerator), not the CPU.
+//  * Between frames loop() sleeps until the next LVGL timer is due (touch is polled every 25 ms).
 //  * Tap the clock face / background to cycle themes, tap the big digits to switch 12h/24h.
 //  * Serial (115200, USB-C port): "T YYYY-MM-DD HH:MM:SS" sets the RTC, "P" sends a screenshot,
 //    "C" next theme, "M" toggle 12/24h, "S" status.  See tools/*.py.
@@ -10,6 +14,10 @@
 #include <M5Unified.h>
 #include <lvgl.h>
 #include <misc/cache/instance/lv_image_cache.h>
+#include <core/lv_refr_private.h>                     // lv_inv_area(): invalidate raw screen areas
+#include <lgfx/v1/platforms/esp32p4/Panel_DSI.hpp>    // frame buffer address
+#include <driver/ppa.h>
+#include <esp_cache.h>
 #include <Preferences.h>
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
@@ -26,17 +34,23 @@
 // ----------------------------------------------------------------------------------------------
 static constexpr int      ROTATION   = 1;    // 1 = landscape, 3 = landscape upside-down
 static constexpr uint8_t  BRIGHTNESS = 200;  // 0..255
+static constexpr int      FRAME_MS   = 66;   // clock animation period (~15 fps)
+static constexpr int      TOUCH_MS   = 25;   // touch polling period while the display is on
 
 static constexpr int SCR_W = 1280, SCR_H = 720;
 static constexpr int CX = 340, CY = 360;     // dial centre
 static constexpr int PX = 724;               // left edge of the right-hand panel
 static constexpr int PW = 516;               // width of the right-hand panel
 
+// Saturated but not neon: deep, tinted backgrounds (never pure black), accents with high chroma and medium-high
+// lightness, and a slightly tinted off-white "ink" instead of pure white for text and hands.
 static const Theme THEMES[] = {
-  {0x0A1030, 0x24104E, 0x2EE6C5, 0xFF6AD5},  // Aurora
-  {0x1E0A1E, 0x4A1530, 0xFF8A5B, 0xFFD166},  // Sunset
-  {0x04121F, 0x0B3E5C, 0x4CC9F0, 0xA7C0FF},  // Ocean
-  {0x0B0B0D, 0x1E1E24, 0xF2F2F7, 0xFF453A},  // Graphite
+  //  name       bg_top    bg_bot    acc1      acc2      acc3      ink
+  {"AURORA",   0x06182C, 0x1C0F40, 0x3DE3B9, 0xFF6FAE, 0x8F7BFF, 0xEAF3F4},
+  {"SUNSET",   0x1E0A22, 0x4C1631, 0xFF8F5C, 0xFFD166, 0xFF5E8A, 0xFFF1E6},
+  {"OCEAN",    0x031526, 0x07405F, 0x40CFF4, 0xFFB26B, 0x6F8CFF, 0xE8F3FF},
+  {"JADE",     0x05201A, 0x0F3D2E, 0x7BE495, 0xFFC857, 0x3CC3CC, 0xEEF7EE},
+  {"GRAPHITE", 0x0C0E13, 0x20242E, 0x5AC8FA, 0xFF5A4F, 0xFFB340, 0xF1F3F7},
 };
 static constexpr int N_THEMES = sizeof(THEMES) / sizeof(THEMES[0]);
 
@@ -99,22 +113,22 @@ static bool ntp_active();
 // The RTC only has 1 s resolution. To phase-lock our ms clock to it we poll quickly until the seconds
 // field changes.  A boundary is only trusted if the two polls around it were close together, so a
 // stalled loop can never move the clock.  After a lock we leave the RTC alone for 10 minutes.
-static void poll_rtc() {
+static bool poll_rtc() {   // returns true while phase-locking (wants a 4 ms poll)
   static bool syncing = false, have_prev = false;
   static int64_t last_poll = 0, prev_done = 0, next_sync = 0, sync_start = 0;
   static int prev_sec = -1;
   const int64_t t0 = mono_ms();
-  if (ntp_active()) return;                  // NTP is the master clock
+  if (ntp_active()) return false;                  // NTP is the master clock
 
   if (!syncing) {
-    if (!g_resync && t0 < next_sync) return;
+    if (!g_resync && t0 < next_sync) return false;
     syncing = true; have_prev = false; g_resync = false; sync_start = t0;
   }
-  if (t0 - last_poll < 4) return;
+  if (t0 - last_poll < 4) return true;
   last_poll = t0;
 
   m5::rtc_datetime_t dt;
-  if (!M5.Rtc.getDateTime(&dt)) return;
+  if (!M5.Rtc.getDateTime(&dt)) return true;
   const int64_t t1 = mono_ms();
   const int64_t sec = rtc_epoch_s(dt);
   const int64_t read_at = (t0 + t1) / 2;
@@ -130,7 +144,7 @@ static void poll_rtc() {
       g_synced = true;
       syncing = false;
       next_sync = t1 + 10 * 60 * 1000;
-      return;
+      return false;
     }
     g_reject_n++;  // a poll was delayed; wait for the next boundary
   }
@@ -138,6 +152,7 @@ static void poll_rtc() {
   prev_sec = dt.time.seconds;
   prev_done = t1;
   if (t1 - sync_start > 4000) { syncing = false; next_sync = t1 + 5000; }  // give up for now
+  return syncing;
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -371,17 +386,62 @@ static void init_rtc_from_build(Preferences& prefs) {
 // LVGL <-> M5GFX glue
 // ----------------------------------------------------------------------------------------------
 static lv_display_t* g_disp = nullptr;
-static uint32_t g_flush_us = 0, g_flush_px = 0, g_flush_n = 0;
+static uint32_t g_flush_us = 0, g_flush_px = 0, g_flush_n = 0, g_frames = 0;
+static int64_t  g_busy_us = 0, g_stat_t0 = 0;   // time loop() spent working (not sleeping) since the last "S"
+
+// The panel is natively 720x1280 portrait and M5GFX keeps its frame buffer in PSRAM.  Rotating LVGL's landscape
+// strips into it pixel-by-pixel on the CPU (M5GFX pushImage) cost ~80 ns/pixel; the PPA's scale-rotate-mirror
+// engine does the same by DMA while the CPU sleeps on a semaphore.  pushImage remains as a fallback.
+static constexpr int FB_W = 720, FB_H = 1280;
+static ppa_client_handle_t g_ppa = nullptr;
+static uint16_t* g_fb = nullptr;
+
+static void ppa_setup() {
+  auto* panel = static_cast<lgfx::Panel_DSI*>(M5.Display.getPanel());
+  g_fb = panel ? (uint16_t*)panel->config_detail().buffer : nullptr;
+  ppa_client_config_t cfg = {};
+  cfg.oper_type = PPA_OPERATION_SRM;
+  cfg.max_pending_trans_num = 1;
+  if (!g_fb || ppa_register_client(&cfg, &g_ppa) != ESP_OK) { g_ppa = nullptr; Serial.println("PPA unavailable, using pushImage"); }
+}
+
+static bool ppa_flush(const lv_area_t* a, const uint8_t* px, int w, int h) {
+  ppa_srm_oper_config_t op = {};
+  op.in.buffer = px;
+  op.in.pic_w = op.in.block_w = w;
+  op.in.pic_h = op.in.block_h = h;
+  op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  op.out.buffer = g_fb;
+  op.out.buffer_size = FB_W * FB_H * 2;
+  op.out.pic_w = FB_W;
+  op.out.pic_h = FB_H;
+  op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  if (ROTATION == 1) {        // logical (x, y) -> panel (719 - y, x): 90 deg clockwise = 270 counter-clockwise
+    op.rotation_angle = PPA_SRM_ROTATION_ANGLE_270;
+    op.out.block_offset_x = FB_W - 1 - a->y2;
+    op.out.block_offset_y = a->x1;
+  } else {                    // logical (x, y) -> panel (y, 1279 - x)
+    op.rotation_angle = PPA_SRM_ROTATION_ANGLE_90;
+    op.out.block_offset_x = a->y1;
+    op.out.block_offset_y = FB_H - 1 - a->x2;
+  }
+  op.scale_x = op.scale_y = 1.0f;
+  op.mode = PPA_TRANS_MODE_BLOCKING;
+  return ppa_do_scale_rotate_mirror(g_ppa, &op) == ESP_OK;
+}
 
 static void flush_cb(lv_display_t* disp, const lv_area_t* a, uint8_t* px) {
   const int w = lv_area_get_width(a), h = lv_area_get_height(a);
   const int64_t t0 = esp_timer_get_time();
-  M5.Display.startWrite();
-  M5.Display.pushImage(a->x1, a->y1, w, h, (const lgfx::rgb565_t*)px);
-  M5.Display.endWrite();
+  if (!g_ppa || !ppa_flush(a, px, w, h)) {
+    M5.Display.startWrite();
+    M5.Display.pushImage(a->x1, a->y1, w, h, (const lgfx::rgb565_t*)px);
+    M5.Display.endWrite();
+  }
   g_flush_us += (uint32_t)(esp_timer_get_time() - t0);
   g_flush_px += (uint32_t)(w * h);
   g_flush_n++;
+  if (lv_display_flush_is_last(disp)) g_frames++;
   lv_display_flush_ready(disp);
 }
 
@@ -390,7 +450,7 @@ static void log_cb(lv_log_level_t, const char* msg) { Serial.print(msg); }
 // The ESP-Hosted driver for the WiFi chip needs a big chunk of *internal* RAM for its SDIO buffer pool,
 // so the LVGL draw buffers live in PSRAM (internal RAM is the scarce resource here).
 static void* alloc_draw_buf(size_t bytes) {
-  void* p = heap_caps_aligned_alloc(64, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  void* p = heap_caps_aligned_alloc(128, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);  // cache-line aligned for the PPA
   if (!p) p = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   return p;
 }
@@ -402,21 +462,46 @@ static Preferences prefs;
 static int  g_theme = 0;
 static bool g_24h = true;
 
-static lv_font_t *f_digits, *f_sec, *f_date, *f_head, *f_num, *f_cal, *f_small;
+static lv_font_t *f_digits, *f_sec, *f_date, *f_head, *f_num, *f_cal, *f_small, *f_tiny;
 
 // Objects that need re-colouring when the theme changes
-static lv_obj_t *bg_img, *day_arc, *bar_sec, *lbl_greet, *lbl_time, *lbl_ampm, *lbl_sec, *lbl_date;
-static lv_obj_t *lbl_wifi, *hub_obj, *lbl_batt, *lbl_month, *hub_in, *sec_tip, *today_mark;
+static lv_obj_t *bg_img, *dial_obj, *secbar_obj, *lbl_greet, *lbl_time, *lbl_ampm, *lbl_sec, *lbl_date;
+static lv_obj_t *lbl_wifi, *lbl_batt, *lbl_month, *today_mark, *week_mark;
 static lv_obj_t *lbl_wd[7], *lbl_day[42];
 
-static LineObj hand_h, hand_m, hand_s, lume_h, lume_m, sh_h, sh_m, sh_s;
-
-static lv_draw_buf_t* g_static_bufs[4];  // one pre-rendered background per theme
+static lv_draw_buf_t* g_static_bufs[N_THEMES];  // one pre-rendered background per theme
 static int g_render_theme = 0;
-static lv_grad_dsc_t g_grad_glow_a, g_grad_glow_b, g_grad_face;
+static lv_grad_dsc_t g_grad_card, g_grad_sheen, g_grad_bar;
+
+// Geometry of the moving parts
+static constexpr float R_RING = 327;          // day-progress ring centre line (6 px wide)
+static constexpr float R_TIP  = 246;          // centre of the second hand's lens tip
+static constexpr float SEG = 36;              // length of the dirty-rectangle pieces along a hand
+static constexpr int BAR_X = PX + 4, BAR_Y = 334, BAR_W = PW - 110, BAR_H = 8;
+
+static const HandSpec HS_H = {-26, 150, 16, 44, 138, 6};
+static const HandSpec HS_M = {-26, 226, 11, 44, 212, 4};
+static constexpr float SH_DX = 5, SH_DY = 8;                    // hour/minute hand shadow offset
+static constexpr float S_R0 = -60, S_TAIL = -20, S_R1 = 237;    // second hand: counterweight, then the thin body
+static constexpr float SS_DX = 4, SS_DY = 7;                    // second hand shadow offset
+
+static float g_ah = 0, g_am = 0, g_as = 0;   // hand angles currently on screen (degrees)
+static int   g_day_m = 0;                    // minutes since midnight shown by the day ring
+static float g_bar = 0;                      // seconds bar fill (0..1)
+static bool  g_show_ring = true, g_show_shadows = true, g_soft_shadows = true;
+
+// Composite: static artwork + day ring + hour/minute hands.  Those only move every 3 s (minute), 30 s (hour) or
+// 60 s (ring), so they are drawn into this image when they move; each frame then only has to blit it and draw the
+// second hand, its tip and the hub on top.
+static lv_draw_buf_t* g_comp = nullptr;
+static lv_obj_t* comp_canvas = nullptr;       // hidden canvas, only used to get a draw layer on g_comp
+static constexpr int MAX_COMP_BOX = 24;
+static lv_area_t g_comp_box[MAX_COMP_BOX];
+static int  g_comp_n = 0;
+static bool g_comp_full = true;
 
 // ----------------------------------------------------------------------------------------------
-// Small widget helpers
+// Small widget / drawing helpers
 // ----------------------------------------------------------------------------------------------
 static lv_obj_t* mk(lv_obj_t* parent, int x, int y, int w, int h) {
   lv_obj_t* o = lv_obj_create(parent);
@@ -442,111 +527,466 @@ static lv_obj_t* mk_label(lv_obj_t* parent, const lv_font_t* font, uint32_t colo
   return l;
 }
 
-static void set_radial(lv_grad_dsc_t* g, uint32_t c0, lv_opa_t o0, uint32_t c1, lv_opa_t o1) {
-  const lv_color_t cols[2] = {lv_color_hex(c0), lv_color_hex(c1)};
-  const lv_opa_t opas[2] = {o0, o1};
-  const uint8_t fr[2] = {0, 255};
-  lv_grad_init_stops(g, cols, opas, fr, 2);
-  lv_grad_radial_init(g, LV_PCT(50), LV_PCT(50), LV_PCT(100), LV_PCT(50), LV_GRAD_EXTEND_PAD);
+static void set_grad(lv_grad_dsc_t* g, int n, const uint32_t* c, const lv_opa_t* o, lv_grad_dir_t dir) {
+  lv_color_t cols[3];
+  uint8_t fr[3];
+  for (int i = 0; i < n; i++) { cols[i] = lv_color_hex(c[i]); fr[i] = (uint8_t)(255 * i / (n - 1)); }
+  lv_grad_init_stops(g, cols, o, fr, n);
+  if (dir == LV_GRAD_DIR_VER) lv_grad_vertical_init(g); else lv_grad_horizontal_init(g);
+}
+
+static inline bool clip_hit(const lv_layer_t* L, float x1, float y1, float x2, float y2) {
+  const lv_area_t& c = L->_clip_area;
+  return x2 >= c.x1 && x1 <= c.x2 && y2 >= c.y1 && y1 <= c.y2;
+}
+
+static void d_line(lv_layer_t* L, float x1, float y1, float x2, float y2, int w, uint32_t col, lv_opa_t opa) {
+  const float p = w / 2.0f + 2;
+  if (!clip_hit(L, fminf(x1, x2) - p, fminf(y1, y2) - p, fmaxf(x1, x2) + p, fmaxf(y1, y2) + p)) return;
+  lv_draw_line_dsc_t d;
+  lv_draw_line_dsc_init(&d);
+  d.p1.x = x1; d.p1.y = y1; d.p2.x = x2; d.p2.y = y2;
+  d.width = w;
+  d.color = lv_color_hex(col);
+  d.opa = opa;
+  d.round_start = d.round_end = 1;
+  lv_draw_line(L, &d);
+}
+
+// A radial line of the dial: angle in degrees clockwise from 12 o'clock, radii from the dial centre,
+// optionally shifted sideways by `off` pixels.
+static void d_polar(lv_layer_t* L, float deg, float r0, float r1, int w, uint32_t col, lv_opa_t opa, float off = 0) {
+  const float a = deg * (float)M_PI / 180.0f, s = sinf(a), c = cosf(a);
+  const float ox = c * off, oy = s * off;
+  d_line(L, CX + s * r0 + ox, CY - c * r0 + oy, CX + s * r1 + ox, CY - c * r1 + oy, w, col, opa);
+}
+
+// Circle outline (w > 0) or arc; LVGL arc angles: 0 = 3 o'clock, clockwise; `r` is the outer radius.
+static void d_arc(lv_layer_t* L, int cx, int cy, int r, int w, float a0, float a1, uint32_t col, lv_opa_t opa, bool round = false) {
+  lv_draw_arc_dsc_t d;
+  lv_draw_arc_dsc_init(&d);
+  d.center.x = cx; d.center.y = cy;
+  d.radius = r;
+  d.width = w;
+  d.start_angle = a0; d.end_angle = a1;
+  d.color = lv_color_hex(col);
+  d.opa = opa;
+  d.rounded = round;
+  lv_draw_arc(L, &d);
+}
+
+static void d_disc(lv_layer_t* L, float cx, float cy, float r, uint32_t col, lv_opa_t opa, lv_opa_t rim = 0) {
+  lv_draw_rect_dsc_t d;
+  lv_draw_rect_dsc_init(&d);
+  d.radius = LV_RADIUS_CIRCLE;
+  d.bg_color = lv_color_hex(col);
+  d.bg_opa = opa;
+  if (rim) { d.border_width = 1; d.border_color = d.bg_color; d.border_opa = rim; }
+  const lv_area_t a = {(int32_t)lroundf(cx - r), (int32_t)lroundf(cy - r), (int32_t)lroundf(cx + r) - 1, (int32_t)lroundf(cy + r) - 1};
+  lv_draw_rect(L, &d, &a);
+}
+
+static void d_sprite(lv_layer_t* L, const lv_draw_buf_t* spr, float cx, float cy) {
+  const int sz = spr->header.w;
+  lv_area_t a;
+  a.x1 = (int32_t)lroundf(cx - (sz - 1) / 2.0f);
+  a.y1 = (int32_t)lroundf(cy - (sz - 1) / 2.0f);
+  a.x2 = a.x1 + sz - 1;
+  a.y2 = a.y1 + sz - 1;
+  if (!clip_hit(L, a.x1, a.y1, a.x2, a.y2)) return;
+  lv_draw_image_dsc_t d;
+  lv_draw_image_dsc_init(&d);
+  d.src = spr;
+  lv_draw_image(L, &d, &a);
 }
 
 // ----------------------------------------------------------------------------------------------
-// Static artwork (rendered once per theme into a snapshot)
+// Sprites: small antialiased ARGB8888 images (lens tip, hub, glowing knobs) computed per theme.
+// Blending one of these is far cheaper than LVGL's blurred box shadows, which were recomputed every frame.
 // ----------------------------------------------------------------------------------------------
-static void ticks_draw_cb(lv_event_t* e) {
-  lv_layer_t* layer = lv_event_get_layer(e);
-  lv_obj_t* obj = (lv_obj_t*)lv_event_get_target(e);
-  lv_area_t a;
-  lv_obj_get_coords(obj, &a);
-  const float cx = (a.x1 + a.x2) / 2.0f, cy = (a.y1 + a.y2) / 2.0f;
-  const Theme& th = THEMES[g_render_theme];
+static lv_draw_buf_t *spr_tip, *spr_hub, *spr_knob, *spr_head;
 
-  for (int i = 0; i < 60; i++) {
-    const bool major = (i % 5) == 0;
-    const float ang = i * 6.0f * (float)M_PI / 180.0f;
-    const float sx = sinf(ang), sy = -cosf(ang);
-    const float r1 = 282.0f, r0 = major ? 250.0f : 268.0f;
+#define HOT __attribute__((optimize("O2")))   // for the per-pixel loops (the sketch is otherwise built with -Os)
+static inline float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+static inline float smooth(float e0, float e1, float v) { const float t = clamp01((v - e0) / (e1 - e0)); return t * t * (3 - 2 * t); }
+static inline float disc_cov(float d, float r) { return clamp01(r - d + 0.5f); }                         // AA disc
+static inline float ring_cov(float d, float r0, float r1) { return disc_cov(d, r1) * clamp01(d - r0 + 0.5f); }
+static Rgba rgba(uint32_t c, float a) { return {((c >> 16) & 255) / 255.f, ((c >> 8) & 255) / 255.f, (c & 255) / 255.f, clamp01(a)}; }
 
-    lv_draw_line_dsc_t d;
-    lv_draw_line_dsc_init(&d);
-    d.round_start = d.round_end = 1;
-    d.width = major ? 7 : 3;
-    d.color = major ? lv_color_hex(th.acc1) : lv_color_white();
-    d.opa = major ? LV_OPA_COVER : LV_OPA_40;
-    d.p1.x = cx + sx * r0; d.p1.y = cy + sy * r0;
-    d.p2.x = cx + sx * r1; d.p2.y = cy + sy * r1;
-    lv_draw_line(layer, &d);
+static void over(Rgba& d, const Rgba& s) {  // Porter-Duff "source over", straight alpha
+  const float a = s.a + d.a * (1 - s.a);
+  if (a <= 0.0f) return;
+  const float k = d.a * (1 - s.a);
+  d.r = (s.r * s.a + d.r * k) / a;
+  d.g = (s.g * s.a + d.g * k) / a;
+  d.b = (s.b * s.a + d.b * k) / a;
+  d.a = a;
+}
+
+static lv_draw_buf_t* sprite_begin(lv_draw_buf_t*& b, int size) {
+  if (!b) b = lv_draw_buf_create(size, size, LV_COLOR_FORMAT_ARGB8888, 0);
+  else lv_image_cache_drop(b);
+  return b;
+}
+
+static void sprite_put(lv_draw_buf_t* b, int x, int y, const Rgba& p) {
+  uint8_t* q = (uint8_t*)b->data + y * b->header.stride + x * 4;   // LVGL ARGB8888 byte order: B G R A
+  q[0] = (uint8_t)(p.b * 255 + 0.5f);
+  q[1] = (uint8_t)(p.g * 255 + 0.5f);
+  q[2] = (uint8_t)(p.r * 255 + 0.5f);
+  q[3] = (uint8_t)(p.a * 255 + 0.5f);
+}
+
+static HOT void make_sprites(const Theme& th) {
+  // Second hand tip: a translucent coloured lens with a bright rim, a soft halo and a small specular highlight
+  lv_draw_buf_t* b = sprite_begin(spr_tip, 64);
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      const float dx = x - 31.5f, dy = y - 31.5f, d = sqrtf(dx * dx + dy * dy);
+      const float hx = dx + 3.2f, hy = dy + 3.6f;
+      Rgba p = {0, 0, 0, 0};
+      over(p, rgba(th.acc2, 0.40f * expf(-d * d / (2 * 8.5f * 8.5f))));
+      over(p, rgba(th.acc2, 0.26f * disc_cov(d, 9.5f)));
+      over(p, rgba(th.acc2, ring_cov(d, 7.2f, 10.0f)));
+      over(p, rgba(th.ink, 0.95f * disc_cov(d, 2.4f)));
+      over(p, rgba(0xFFFFFF, 0.50f * expf(-(hx * hx + hy * hy) / 3.0f) * disc_cov(d, 9.5f)));
+      sprite_put(b, x, y, p);
+    }
+  // Hub: soft drop shadow, a gently shaded dome with a machined groove, and a coloured jewel
+  b = sprite_begin(spr_hub, 72);
+  for (int y = 0; y < 72; y++)
+    for (int x = 0; x < 72; x++) {
+      const float dx = x - 35.5f, dy = y - 35.5f, d = sqrtf(dx * dx + dy * dy);
+      const float sx = dx - 2, sy = dy - 6, sd = sqrtf(sx * sx + sy * sy);
+      const float jx = dx + 2.2f, jy = dy + 2.4f;
+      Rgba p = {0, 0, 0, 0};
+      over(p, rgba(0x000000, 0.50f * (1 - smooth(12, 27, sd))));
+      Rgba dome = rgba(th.ink, disc_cov(d, 18));
+      const float lit = 0.80f + 0.20f * clamp01(0.5f - dy / 36.0f);
+      dome.r *= lit; dome.g *= lit; dome.b *= lit;
+      over(p, dome);
+      over(p, rgba(0x000000, 0.22f * ring_cov(d, 16.6f, 18.0f)));
+      over(p, rgba(0x000000, 0.16f * ring_cov(d, 11.0f, 12.0f)));
+      over(p, rgba(th.acc2, disc_cov(d, 7.0f)));
+      over(p, rgba(0xFFFFFF, 0.60f * expf(-(jx * jx + jy * jy) / 2.5f)));
+      sprite_put(b, x, y, p);
+    }
+  // Day ring knob and seconds-bar head: glowing beads
+  b = sprite_begin(spr_knob, 44);
+  for (int y = 0; y < 44; y++)
+    for (int x = 0; x < 44; x++) {
+      const float dx = x - 21.5f, dy = y - 21.5f, d = sqrtf(dx * dx + dy * dy);
+      Rgba p = {0, 0, 0, 0};
+      over(p, rgba(th.acc1, 0.55f * expf(-d * d / (2 * 6.5f * 6.5f))));
+      over(p, rgba(th.acc1, disc_cov(d, 6.5f)));
+      over(p, rgba(th.ink, disc_cov(d, 2.6f)));
+      sprite_put(b, x, y, p);
+    }
+  b = sprite_begin(spr_head, 36);
+  for (int y = 0; y < 36; y++)
+    for (int x = 0; x < 36; x++) {
+      const float dx = x - 17.5f, dy = y - 17.5f, d = sqrtf(dx * dx + dy * dy);
+      Rgba p = {0, 0, 0, 0};
+      over(p, rgba(th.acc2, 0.55f * expf(-d * d / (2 * 5.0f * 5.0f))));
+      over(p, rgba(th.acc2, disc_cov(d, 5.5f)));
+      over(p, rgba(th.ink, disc_cov(d, 2.0f)));
+      sprite_put(b, x, y, p);
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// Static artwork (rendered once per theme into an image)
+// ----------------------------------------------------------------------------------------------
+// The soft background and the radial parts of the dial are painted per pixel straight into a 32-bit buffer, in
+// float, before LVGL draws the crisp details on top:
+//  * gradient, coloured glows, aurora-like ribbons with fine "curtain" striations and a vignette - all smooth, so they
+//    are evaluated on a 1/4-resolution grid and bilinearly upsampled;
+//  * the dial at full resolution: drop shadow, smoked-glass face with a reflection, guilloche rings, sunburst rays,
+//    minute-track and bezel rings, and the day-ring track.
+static float g_exp_lut[1024];                  // exp(-t/2), t = i/64
+static inline float gauss(float t) { const int i = (int)(t * 64.0f); return i >= 0 && i < 1024 ? g_exp_lut[i] : 0.0f; }  // t = (d/sigma)^2
+static inline float ring_at(float d, float rc, float w) { return clamp01(w * 0.5f + 0.5f - fabsf(d - rc)); }  // AA ring coverage
+static inline void mix_to(float* c, const float* to, float a) { c[0] += (to[0] - c[0]) * a; c[1] += (to[1] - c[1]) * a; c[2] += (to[2] - c[2]) * a; }
+static inline void screen_add(float* c, const float* col, float a) { for (int i = 0; i < 3; i++) c[i] += col[i] * a * (1 - c[i]); }
+
+
+// NOTE: newlib's float trig (sinf, atan2f, ...) goes through software double precision on the P4 (single-precision
+// FPU only) and costs thousands of cycles, so the per-pixel code avoids it: ribbon shapes are tabulated per column
+// and atan2 is a polynomial.
+static inline float fast_atan2f(float y, float x) {   // |error| < 1e-5 rad
+  const float ax = fabsf(x), ay = fabsf(y), mx = fmaxf(ax, ay);
+  if (mx == 0) return 0;
+  const float a = fminf(ax, ay) / mx, s = a * a;
+  float r = a * (0.99997726f + s * (-0.33262347f + s * (0.19354346f + s * (-0.11643287f + s * (0.05265332f + s * -0.01172120f)))));
+  if (ay > ax) r = 1.57079637f - r;
+  if (x < 0) r = 3.14159274f - r;
+  return y < 0 ? -r : r;
+}
+
+static HOT void sky_at(const Theme& th, const Glow* glows, const Ribbon* ribs, const RibbonCol* rc2, float x, float y, float* c) {
+  const Rgba top = rgba(th.bg_top, 1), bot = rgba(th.bg_bot, 1);
+  const float t = clamp01(y / (SCR_H - 1));
+  c[0] = top.r + (bot.r - top.r) * t; c[1] = top.g + (bot.g - top.g) * t; c[2] = top.b + (bot.b - top.b) * t;
+  for (int k = 0; k < 3; k++) {         // glows and ribbons use "screen" blending: they add light, keep saturation
+    const Glow& g = glows[k];
+    const float u = (x - g.x) / g.sx, v = (y - g.y) / g.sy;
+    const Rgba gc = rgba(g.c, 1);
+    const float col[3] = {gc.r, gc.g, gc.b};
+    screen_add(c, col, g.amp * gauss(u * u + v * v));
+  }
+  for (int k = 0; k < 2; k++) {
+    const RibbonCol& r = rc2[k];
+    const float dy = y - r.yc, w = r.w * (dy < 0 ? 0.45f : 1.6f);   // sharp upper edge, long fade downwards
+    const Rgba rc = rgba(ribs[k].c, 1);
+    const float col[3] = {rc.r, rc.g, rc.b};
+    screen_add(c, col, r.amp * gauss(dy * dy / (w * w)));
+  }
+  const float vx = (x - SCR_W / 2) / (SCR_W * 0.60f), vy = (y - SCR_H / 2) / (SCR_H * 0.60f);
+  const float vig = 1.0f - 0.50f * clamp01((vx * vx + vy * vy - 0.25f) / 1.0f);
+  c[0] *= vig; c[1] *= vig; c[2] *= vig;
+}
+
+// smoothstep with a precomputed 1/(e1-e0): the sketch is built with -Os, so divisions are real divisions
+static inline float smooth_r(float e0, float inv, float v) { const float t = clamp01((v - e0) * inv); return t * t * (3 - 2 * t); }
+
+static HOT void dial_at(const DialCols& dc, float x, float y, float* c) {
+  const float dx = x - CX, dy = y - CY, d2 = dx * dx + dy * dy;
+  if (d2 > 345.0f * 345.0f) return;
+  const float d = sqrtf(d2);
+  const float *ink = dc.ink, *acc3 = dc.acc3, black[3] = {0, 0, 0};
+
+  const float sy = dy - 20, ds2 = dx * dx + sy * sy;                   // drop shadow, offset downwards
+  if (ds2 < 350.0f * 350.0f) mix_to(c, black, ds2 < 262.0f * 262.0f ? 0.55f : 0.55f * (1 - smooth_r(262, 1 / 88.0f, sqrtf(ds2))));
+  if (d < 301) {
+    const float cov = clamp01(300.5f - d), t = d * (1 / 300.0f);
+    mix_to(c, black, (0.30f + 0.36f * t * t) * cov);                 // smoked glass, darker towards the rim
+    screen_add(c, acc3, 0.10f * (1 - t) * (1 - t) * cov);             // faint coloured light in the centre
+    if (dy < -18) {                                                   // reflection across the top
+      const float ex = dx * (1 / 255.0f), ey = (dy + 150) * (1 / 132.0f), e = ex * ex + ey * ey;
+      if (e < 1) mix_to(c, ink, 0.12f * clamp01((-dy - 22) * (1 / 250.0f)) * (1 - smooth_r(0.55f, 1 / 0.45f, e)));
+    }
+    if (d > 12 && d < 119) {                                          // guilloche rings in the sub-dial
+      const int k = (int)(d * (1 / 6.0f) + 0.5f);
+      mix_to(c, ink, (k % 3 == 0 ? 0.075f : 0.045f) * clamp01(1 - fabsf(d - 6 * k)));
+    } else if (d > 138 && d < 264) {                                  // sunburst rays every 2 degrees
+      constexpr float step = 2.0f * (float)M_PI / 180.0f;
+      const float u = fast_atan2f(dx, -dy) * (1 / step);
+      const float dist = fabsf(u - roundf(u)) * step * d;
+      if (dist < 1) mix_to(c, ink, 0.045f * (1 - dist) * smooth_r(138, 1 / 22.0f, d) * (1 - smooth_r(244, 1 / 20.0f, d)));
+    }
+  }
+  float a = 0;                                                        // rings: sub-dial, minute track, bezel, day track
+  if (fabsf(d - 131) < 2) a += 0.18f * ring_at(d, 131, 2);
+  if (fabsf(d - 268) < 1.5f) a += 0.16f * ring_at(d, 268, 1);
+  if (fabsf(d - 288) < 1.5f) a += 0.16f * ring_at(d, 288, 1);
+  if (fabsf(d - R_RING) < 4) a += 0.09f * ring_at(d, R_RING, 6);
+  if (fabsf(d - 301.5f) < 3.5f) {                                     // glass bezel: lit top edge, shaded bottom edge
+    const float up = -dy / d;
+    a += 0.12f * ring_at(d, 301, 3);
+    mix_to(c, ink, a + 0.50f * ring_at(d, 301, 2) * smooth_r(0.35f, 2.0f, up));
+    mix_to(c, black, 0.45f * ring_at(d, 302.5f, 3) * smooth_r(0.35f, 2.0f, -up));
+  } else if (a > 0) {
+    mix_to(c, ink, a);
   }
 }
 
-static lv_obj_t* build_static_screen(const Theme& th) {
+// Runs on the UI thread for the first theme and in paint_task (core 0) for the others: no LVGL calls in here.
+static HOT void paint_background(uint32_t* data, int stride_px, const Theme& th) {
+  if (g_exp_lut[0] == 0) for (int i = 0; i < 1024; i++) g_exp_lut[i] = expf(-0.5f * i / 64.0f);
+  const Glow glows[3] = {
+    {CX, CY, 470, 470, 0.22f, th.acc3},                   // behind the dial
+    {PX + PW - 30, 20, 430, 330, 0.18f, th.acc1},         // top right
+    {PX + PW / 2, SCR_H + 40, 480, 280, 0.16f, th.acc1},  // under the calendar
+  };
+  const Ribbon ribs[2] = {
+    // y0    slope   a1  k1       p1    a2  k2      p2    w   amp    k3      p3
+    {585, -0.36f, 44, 0.0041f, 0.6f, 16, 0.011f, 2.0f, 64, 0.16f, 0.047f, 0.3f, th.acc1},
+    {300, -0.20f, 56, 0.0030f, 2.4f, 20, 0.009f, 0.7f, 54, 0.11f, 0.061f, 1.1f, th.acc3},
+  };
+  DialCols dc;
+  const Rgba ik = rgba(th.ink, 1), a3 = rgba(th.acc3, 1);
+  dc.ink[0] = ik.r; dc.ink[1] = ik.g; dc.ink[2] = ik.b;
+  dc.acc3[0] = a3.r; dc.acc3[1] = a3.g; dc.acc3[2] = a3.b;
+  constexpr int S = 4, GW = SCR_W / S + 1, GH = SCR_H / S + 1;
+  float* grid = (float*)heap_caps_malloc(sizeof(float) * 3 * GW * GH + sizeof(RibbonCol) * 2 * GW, MALLOC_CAP_SPIRAM);  // internal RAM is for WiFi
+  if (!grid) return;
+  RibbonCol* rcol = (RibbonCol*)(grid + 3 * GW * GH);
+  for (int i = 0; i < GW; i++)
+    for (int k = 0; k < 2; k++) {
+      const Ribbon& r = ribs[k];
+      const float x = i * S;
+      RibbonCol& o = rcol[i * 2 + k];
+      o.yc = r.y0 + r.slope * x + r.a1 * sinf(r.k1 * x + r.p1) + r.a2 * sinf(r.k2 * x + r.p2);
+      o.amp = r.amp * (0.70f + 0.30f * sinf(r.k3 * x + r.p3)) * (0.93f + 0.07f * sinf(0.23f * x + 5 * r.p3));  // curtains
+      o.w = r.w * (0.85f + 0.25f * sinf(0.0071f * x + r.p2));
+    }
+  for (int j = 0; j < GH; j++)
+    for (int i = 0; i < GW; i++) sky_at(th, glows, ribs, rcol + i * 2, i * S, j * S, grid + (j * GW + i) * 3);
+
+  for (int y = 0; y < SCR_H; y++) {
+    const int gj = y / S;
+    const float fy = (y % S) / (float)S;
+    const float *g0 = grid + gj * GW * 3, *g1 = g0 + GW * 3;
+    uint32_t* out = data + y * stride_px;
+    for (int x = 0; x < SCR_W; x++) {
+      const int gi = x / S;
+      const float fx = (x % S) / (float)S;
+      float c[3];
+      for (int k = 0; k < 3; k++) {
+        const float a = g0[gi * 3 + k] + (g0[gi * 3 + 3 + k] - g0[gi * 3 + k]) * fx;
+        const float b = g1[gi * 3 + k] + (g1[gi * 3 + 3 + k] - g1[gi * 3 + k]) * fx;
+        c[k] = a + (b - a) * fy;
+      }
+      if (x < CX + 346 && y > CY - 346 && y < CY + 346) dial_at(dc, x, y, c);
+      out[x] = 0xFF000000u | ((uint32_t)(clamp01(c[0]) * 255 + 0.5f) << 16) |
+               ((uint32_t)(clamp01(c[1]) * 255 + 0.5f) << 8) | (uint32_t)(clamp01(c[2]) * 255 + 0.5f);
+    }
+  }
+  heap_caps_free(grid);
+}
+
+// Bokeh: translucent discs with a faint rim (the ones under the calendar get blurred by its frosted glass)
+static void bokeh_draw_cb(lv_event_t* e) {
+  lv_layer_t* L = lv_event_get_layer(e);
+  const Theme& th = THEMES[g_render_theme];
+  const uint32_t cols[3] = {th.acc1, th.acc2, th.acc3};
+  uint32_t seed = 0x2545F491u;
+  auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) / 16777216.0f; };
+  for (int i = 0, n = 0; i < 200 && n < 16; i++) {
+    const float x = rnd() * SCR_W, y = rnd() * SCR_H, r = 6 + rnd() * rnd() * 46;
+    const lv_opa_t fill = (lv_opa_t)(6 + rnd() * 12);
+    if (hypotf(x - CX, y - CY) < 330 + r) continue;                              // the dial
+    if (x + r > PX - 10 && x - r < PX + 480 && y + r > 70 && y - r < 245) continue;  // the big digits
+    d_disc(L, x, y, r, cols[n++ % 3], fill, fill + 14);
+  }
+}
+
+// Dial details: guilloche sub-dial, sunburst, railway minute track, applied indices, glass bezel, day-ring track
+static void dial_deco_cb(lv_event_t* e) {
+  lv_layer_t* L = lv_event_get_layer(e);
+  const Theme& th = THEMES[g_render_theme];
+
+  for (int i = 0; i < 60; i++) d_polar(L, i * 6.0f, 121, i % 5 ? 126 : 129, 1, th.ink, i % 5 ? 36 : 80);
+  for (int i = 0; i < 240; i++) if (i % 4) d_polar(L, i * 1.5f, 282, 288, 1, th.ink, 48);
+  for (int i = 0; i < 60; i++) if (i % 5) d_polar(L, i * 6.0f, 268, 288, 2, th.ink, 120);
+  for (int i = 0; i < 12; i++) {
+    const int n = i == 0 ? 2 : 1;                        // doubled index at 12 o'clock
+    for (int k = 0; k < n; k++) {
+      const float off = n == 2 ? (k ? 6.5f : -6.5f) : 0;
+      d_polar(L, i * 30.0f, 247, 289, 16, th.acc1, 46, off);       // coloured glow
+      d_polar(L, i * 30.0f, 251, 285, 7, th.acc1, 255, off);       // body
+      d_polar(L, i * 30.0f, 253, 283, 2, th.ink, 170, off - 1.2f); // lit edge
+    }
+  }
+  for (int h = 0; h < 24; h++) {                          // hour dots on the day-ring track
+    const float a = h * 15.0f * (float)M_PI / 180.0f;
+    const float x = CX + sinf(a) * R_RING, y = CY - cosf(a) * R_RING;
+    if (h % 6 == 0) d_disc(L, x, y, 3.5f, th.acc1, 230);
+    else d_disc(L, x, y, 1.8f, th.ink, 120);
+  }
+}
+
+// Seconds bar track with 5-second ticks
+static void panel_deco_cb(lv_event_t* e) {
+  lv_layer_t* L = lv_event_get_layer(e);
+  const Theme& th = THEMES[g_render_theme];
+  lv_draw_rect_dsc_t d;
+  lv_draw_rect_dsc_init(&d);
+  d.radius = LV_RADIUS_CIRCLE;
+  d.bg_color = lv_color_hex(th.ink);
+  d.bg_opa = 26;
+  const lv_area_t a = {BAR_X, BAR_Y, BAR_X + BAR_W - 1, BAR_Y + BAR_H - 1};
+  lv_draw_rect(L, &d, &a);
+  for (int i = 0; i <= 12; i++) {
+    const float x = BAR_X + 4 + i * (BAR_W - 8) / 12.0f;
+    const bool major = i % 3 == 0;
+    d_line(L, x, BAR_Y + BAR_H + 7, x, BAR_Y + BAR_H + (major ? 14 : 10), major ? 2 : 1, th.ink, major ? 100 : 55);
+  }
+}
+
+static lv_obj_t* build_static_screen(const Theme& th, const lv_draw_buf_t* bg) {
   lv_obj_t* s = lv_obj_create(nullptr);
   lv_obj_remove_style_all(s);
   lv_obj_set_size(s, SCR_W, SCR_H);
   lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(s, lv_color_hex(th.bg_top), 0);
-  lv_obj_set_style_bg_grad_color(s, lv_color_hex(th.bg_bot), 0);
-  lv_obj_set_style_bg_grad_dir(s, LV_GRAD_DIR_VER, 0);
 
-  // Soft glows
-  set_radial(&g_grad_glow_a, th.acc2, 70, th.acc2, 0);
-  lv_obj_t* glow = mk(s, CX - 520, CY - 520, 1040, 1040);
-  lv_obj_set_style_bg_grad(glow, &g_grad_glow_a, 0);
+  lv_obj_t* bgi = lv_image_create(s);
+  lv_image_set_src(bgi, bg);
+  lv_obj_set_pos(bgi, 0, 0);
 
-  set_radial(&g_grad_glow_b, th.acc1, 46, th.acc1, 0);
-  lv_obj_t* glow2 = mk(s, PX + PW - 340, -260, 800, 800);
-  lv_obj_set_style_bg_grad(glow2, &g_grad_glow_b, 0);
+  lv_obj_t* bokeh = mk(s, 0, 0, SCR_W, SCR_H);
+  lv_obj_add_event_cb(bokeh, bokeh_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
 
-  // Dial face
-  set_radial(&g_grad_face, 0xFFFFFF, 26, 0x000000, 96);
-  lv_obj_t* face = mk(s, CX - 300, CY - 300, 600, 600);
-  lv_obj_set_style_radius(face, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_grad(face, &g_grad_face, 0);
-  lv_obj_set_style_border_width(face, 2, 0);
-  lv_obj_set_style_border_color(face, lv_color_white(), 0);
-  lv_obj_set_style_border_opa(face, LV_OPA_20, 0);
-  lv_obj_set_style_shadow_width(face, 60, 0);
-  lv_obj_set_style_shadow_color(face, lv_color_black(), 0);
-  lv_obj_set_style_shadow_opa(face, LV_OPA_50, 0);
-  lv_obj_set_style_shadow_offset_y(face, 18, 0);
+  lv_obj_t* det = mk(s, CX - 340, CY - 340, 680, 680);
+  lv_obj_add_event_cb(det, dial_deco_cb, LV_EVENT_DRAW_MAIN, nullptr);
 
-  // Inner decorative rings
-  lv_obj_t* ring = mk(s, CX - 130, CY - 130, 260, 260);
-  lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_border_width(ring, 1, 0);
-  lv_obj_set_style_border_color(ring, lv_color_white(), 0);
-  lv_obj_set_style_border_opa(ring, LV_OPA_10, 0);
-
-  // Ticks
-  lv_obj_t* ticks = mk(s, CX - 330, CY - 330, 660, 660);
-  lv_obj_add_event_cb(ticks, ticks_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
-
-  // Numerals
-  lv_obj_update_layout(s);
+  // Numerals, each with a soft shadow
   for (int i = 1; i <= 12; i++) {
     char t[4];
     snprintf(t, sizeof(t), "%d", i);
     const float ang = i * 30.0f * (float)M_PI / 180.0f;
     const float rx = CX + sinf(ang) * 212.0f, ry = CY - cosf(ang) * 212.0f;
-    lv_obj_t* l = mk_label(s, f_num, i % 3 == 0 ? th.acc1 : 0xFFFFFF, i % 3 == 0 ? LV_OPA_COVER : LV_OPA_80,
-                           t, 0, 0, 100, LV_TEXT_ALIGN_CENTER);
+    const bool card = i % 3 == 0;
+    lv_obj_t* sh = mk_label(s, f_num, 0x000000, LV_OPA_50, t, 0, 0, 100, LV_TEXT_ALIGN_CENTER);
+    lv_obj_t* l = mk_label(s, f_num, card ? th.acc1 : th.ink, card ? LV_OPA_COVER : 225, t, 0, 0, 100, LV_TEXT_ALIGN_CENTER);
     lv_obj_update_layout(l);
-    lv_obj_set_pos(l, (int)rx - 50, (int)ry - lv_obj_get_height(l) / 2);
+    const int y = (int)ry - lv_obj_get_height(l) / 2;
+    lv_obj_set_pos(sh, (int)rx - 50 + 1, y + 3);
+    lv_obj_set_pos(l, (int)rx - 50, y);
   }
 
-  // Brand
-  lv_obj_t* brand = mk_label(s, f_small, 0xFFFFFF, LV_OPA_40, "TAB5", 0, CY - 128, 200, LV_TEXT_ALIGN_CENTER);
+  lv_obj_t* brand = mk_label(s, f_tiny, th.ink, 110, "TAB5", CX - 100, CY - 92, 200, LV_TEXT_ALIGN_CENTER);
   lv_obj_set_style_text_letter_space(brand, 8, 0);
-  lv_obj_set_x(brand, CX - 100);
+  lv_obj_t* tname = mk_label(s, f_tiny, th.acc1, 150, th.name, CX - 100, CY + 70, 200, LV_TEXT_ALIGN_CENTER);
+  lv_obj_set_style_text_letter_space(tname, 6, 0);
 
-  // Calendar card (glass)
+  // Right panel: a glass pill behind the status icons, the seconds bar track
+  lv_obj_t* pill = mk(s, PX + PW - 186, 25, 200, 42);
+  lv_obj_set_style_radius(pill, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(pill, lv_color_hex(th.ink), 0);
+  lv_obj_set_style_bg_opa(pill, 16, 0);
+  lv_obj_set_style_border_width(pill, 1, 0);
+  lv_obj_set_style_border_color(pill, lv_color_hex(th.ink), 0);
+  lv_obj_set_style_border_opa(pill, 34, 0);
+
+  lv_obj_t* pd = mk(s, PX, BAR_Y - 10, PW, 40);
+  lv_obj_add_event_cb(pd, panel_deco_cb, LV_EVENT_DRAW_MAIN, nullptr);
+
+  // Calendar card: frosted glass (blurs the ribbons and bokeh behind it), lit top edge, drop shadow
   lv_obj_t* card = mk(s, PX, 392, PW, 296);
-  lv_obj_set_style_radius(card, 30, 0);
-  lv_obj_set_style_bg_color(card, lv_color_white(), 0);
-  lv_obj_set_style_bg_opa(card, LV_OPA_10, 0);
+  lv_obj_set_style_radius(card, 28, 0);
+  lv_obj_set_style_blur_backdrop(card, true, 0);
+  lv_obj_set_style_blur_radius(card, 26, 0);
+  {
+    const uint32_t c[2] = {th.ink, th.ink};
+    const lv_opa_t o[2] = {34, 12};
+    set_grad(&g_grad_card, 2, c, o, LV_GRAD_DIR_VER);
+  }
+  lv_obj_set_style_bg_grad(card, &g_grad_card, 0);
   lv_obj_set_style_border_width(card, 1, 0);
-  lv_obj_set_style_border_color(card, lv_color_white(), 0);
-  lv_obj_set_style_border_opa(card, LV_OPA_20, 0);
+  lv_obj_set_style_border_color(card, lv_color_hex(th.ink), 0);
+  lv_obj_set_style_border_opa(card, 36, 0);
+  lv_obj_set_style_shadow_width(card, 50, 0);
+  lv_obj_set_style_shadow_color(card, lv_color_black(), 0);
+  lv_obj_set_style_shadow_opa(card, 110, 0);
+  lv_obj_set_style_shadow_offset_y(card, 16, 0);
+  lv_obj_set_style_shadow_spread(card, -6, 0);
+  {
+    const uint32_t c[3] = {th.ink, th.ink, th.ink};
+    const lv_opa_t o[3] = {0, 150, 0};
+    set_grad(&g_grad_sheen, 3, c, o, LV_GRAD_DIR_HOR);
+    lv_obj_t* sheen = mk(s, PX + 40, 392, PW - 80, 2);
+    lv_obj_set_style_bg_grad(sheen, &g_grad_sheen, 0);
+  }
+  // faint tint behind the weekend columns
+  const int cw = (PW - 40) / 7, gx = PX + 20;
+  for (int c = 0; c < 7; c += 6) {
+    lv_obj_t* col = mk(s, gx + c * cw + 8, 448, cw - 16, 234);
+    lv_obj_set_style_radius(col, 16, 0);
+    lv_obj_set_style_bg_color(col, lv_color_hex(th.acc2), 0);
+    lv_obj_set_style_bg_opa(col, 14, 0);
+  }
 
   lv_obj_update_layout(s);
   return s;
@@ -554,7 +994,7 @@ static lv_obj_t* build_static_screen(const Theme& th) {
 
 // RGB565 bands badly on smooth gradients, so the artwork is rendered in 32 bit and
 // ordered-dithered (4x4 Bayer) down to the RGB565 image that is actually displayed.
-static lv_draw_buf_t* dither_to_rgb565(const lv_draw_buf_t* src) {
+static HOT lv_draw_buf_t* dither_to_rgb565(const lv_draw_buf_t* src) {
   static const uint8_t bayer[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
   const uint32_t w = src->header.w, h = src->header.h;
   lv_draw_buf_t* dst = lv_draw_buf_create(w, h, LV_COLOR_FORMAT_RGB565, 0);
@@ -576,101 +1016,251 @@ static lv_draw_buf_t* dither_to_rgb565(const lv_draw_buf_t* src) {
   return dst;
 }
 
-// Render (once) the background for theme `idx`; later calls are free.
-static void render_static(int idx) {
-  if (g_static_bufs[idx]) return;
+// Render (once) the artwork for theme `idx`, from a background painted by paint_task if there is one.
+static void render_static(int idx, uint32_t* painted = nullptr) {
+  if (g_static_bufs[idx]) { heap_caps_free(painted); return; }
   const int64_t t0 = esp_timer_get_time();
   g_render_theme = idx;
-  lv_obj_t* s = build_static_screen(THEMES[idx]);
-  lv_draw_buf_t* full = lv_snapshot_take(s, LV_COLOR_FORMAT_XRGB8888);
-  lv_obj_delete(s);
+  uint32_t* px = painted ? painted : (uint32_t*)heap_caps_aligned_alloc(64, SCR_W * SCR_H * 4, MALLOC_CAP_SPIRAM);
+  lv_draw_buf_t* full = nullptr;
+  if (px) {
+    if (!painted) paint_background(px, SCR_W, THEMES[idx]);
+    static lv_draw_buf_t bg;
+    lv_draw_buf_init(&bg, SCR_W, SCR_H, LV_COLOR_FORMAT_XRGB8888, SCR_W * 4, px, SCR_W * SCR_H * 4);
+    lv_obj_t* s = build_static_screen(THEMES[idx], &bg);
+    full = lv_snapshot_take(s, LV_COLOR_FORMAT_XRGB8888);
+    lv_obj_delete(s);
+    lv_image_cache_drop(&bg);
+    heap_caps_free(px);
+  }
   g_static_bufs[idx] = full ? dither_to_rgb565(full) : nullptr;
   if (full) lv_draw_buf_destroy(full);
-  Serial.printf("theme %d artwork rendered in %d ms%s\n", idx, (int)((esp_timer_get_time() - t0) / 1000),
-                g_static_bufs[idx] ? "" : " (FAILED)");
+  Serial.printf("theme %d artwork rendered in %d ms%s%s\n", idx, (int)((esp_timer_get_time() - t0) / 1000),
+                painted ? " (background pre-painted)" : "", g_static_bufs[idx] ? "" : " (FAILED)");
+}
+
+// The per-pixel painting of the other themes' backgrounds runs on core 0 at idle priority, one at a time; the UI
+// thread only has to snapshot + dither each one (~0.3 s).
+static uint32_t* volatile g_painted[N_THEMES];
+
+static void paint_task(void*) {
+  for (int i = 0; i < N_THEMES; i++) {
+    if (i == g_theme) continue;
+    uint32_t* px = (uint32_t*)heap_caps_aligned_alloc(64, SCR_W * SCR_H * 4, MALLOC_CAP_SPIRAM);
+    if (!px) break;
+    paint_background(px, SCR_W, THEMES[i]);
+    g_painted[i] = px;
+    while (g_painted[i]) vTaskDelay(pdMS_TO_TICKS(100));   // wait until the UI has used it (bounds PSRAM use)
+  }
+  vTaskDelete(nullptr);
 }
 
 static void show_static() {
   if (!g_static_bufs[g_theme]) render_static(g_theme);
-  if (!g_static_bufs[g_theme]) return;
-  lv_image_set_src(bg_img, g_static_bufs[g_theme]);
-  lv_obj_invalidate(bg_img);
+  g_comp_full = true;   // re-composited (and redrawn) on the next frame
 }
 
 // ----------------------------------------------------------------------------------------------
-// Dynamic widgets
+// Live layer: day ring, hands and hub are drawn by one callback; only small areas around what moved are
+// invalidated each frame (lv_inv_area directly - lv_obj_invalidate walks the whole object tree every call).
 // ----------------------------------------------------------------------------------------------
-static void make_line(LineObj& L, lv_obj_t* parent, int width, uint32_t color, lv_opa_t opa) {
-  L.o = lv_line_create(parent);
-  lv_obj_remove_style_all(L.o);
-  lv_obj_set_style_line_width(L.o, width, 0);
-  lv_obj_set_style_line_color(L.o, lv_color_hex(color), 0);
-  lv_obj_set_style_line_opa(L.o, opa, 0);
-  lv_obj_set_style_line_rounded(L.o, true, 0);
-  L.p[0] = {0, 0};
-  L.p[1] = {1, 1};
-  lv_line_set_points_mutable(L.o, L.p, 2);
+static void inv_box(float x1, float y1, float x2, float y2) {    // redraw this screen area
+  const lv_area_t a = {(int32_t)floorf(x1), (int32_t)floorf(y1), (int32_t)ceilf(x2), (int32_t)ceilf(y2)};
+  lv_inv_area(g_disp, &a);
 }
 
-// Place a line between two absolute points, keeping its object bounds tight so redraws stay small.
-static void place_line(LineObj& L, float x1, float y1, float x2, float y2) {
-  const int pad = lv_obj_get_style_line_width(L.o, LV_PART_MAIN) / 2 + 2;
-  const int minx = (int)floorf(fminf(x1, x2)) - pad, miny = (int)floorf(fminf(y1, y2)) - pad;
-  const int maxx = (int)ceilf(fmaxf(x1, x2)) + pad, maxy = (int)ceilf(fmaxf(y1, y2)) + pad;
-  lv_obj_set_pos(L.o, minx, miny);
-  lv_obj_set_size(L.o, maxx - minx, maxy - miny);
-  L.p[0] = {(lv_value_precise_t)(x1 - minx), (lv_value_precise_t)(y1 - miny)};
-  L.p[1] = {(lv_value_precise_t)(x2 - minx), (lv_value_precise_t)(y2 - miny)};
-  lv_line_set_points_mutable(L.o, L.p, 2);
+static void comp_box(float x1, float y1, float x2, float y2) {   // re-composite (and then redraw) this area
+  if (g_comp_n == MAX_COMP_BOX) { g_comp_full = true; return; }
+  lv_area_t& a = g_comp_box[g_comp_n++];
+  a.x1 = max(0, (int)floorf(x1)); a.y1 = max(0, (int)floorf(y1));
+  a.x2 = min(SCR_W - 1, (int)ceilf(x2)); a.y2 = min(SCR_H - 1, (int)ceilf(y2));
 }
 
-static void place_hand(LineObj& L, float deg, float r0, float r1, float ox = 0, float oy = 0) {
-  const float a = deg * (float)M_PI / 180.0f;
-  const float sx = sinf(a), sy = -cosf(a);
-  place_line(L, CX + sx * r0 + ox, CY + sy * r0 + oy, CX + sx * r1 + ox, CY + sy * r1 + oy);
-}
-
-static void set_hands_hm(const Now& n, bool hour_too) {
-  const float min_f = n.mi + n.s / 60.0f;
-  const float hr_f = (n.h % 12) + min_f / 60.0f;
-  const float ah = hr_f * 30.0f, am = min_f * 6.0f;
-  if (hour_too) {
-    place_hand(sh_h, ah, 0, 150, 6, 9);
-    place_hand(hand_h, ah, 0, 150);
-    place_hand(lume_h, ah, 42, 136);
+// Invalidate what a hand covers at angle d0 and at d1 (old and new position) including its shadow, as a chain of
+// short boxes hugging the (usually diagonal) line rather than one big bounding box.
+static void inv_hand(BoxSink sink, float d0, float d1, float r0, float r1, float pad, float shx, float shy) {
+  if (fabsf(d1 - d0) > 3.0f) {  // a big jump: two separate chains are smaller than one fat one
+    inv_hand(sink, d0, d0, r0, r1, pad, shx, shy);
+    inv_hand(sink, d1, d1, r0, r1, pad, shx, shy);
+    return;
   }
-  place_hand(sh_m, am, 0, 224, 6, 9);
-  place_hand(hand_m, am, 0, 224);
-  place_hand(lume_m, am, 42, 210);
+  const float a0 = d0 * (float)M_PI / 180.0f, a1 = d1 * (float)M_PI / 180.0f;
+  const float s0 = sinf(a0), c0 = cosf(a0), s1 = sinf(a1), c1 = cosf(a1);
+  const int n = max(1, (int)ceilf((r1 - r0) / SEG));
+  for (int i = 0; i < n; i++) {
+    const float ra = r0 + (r1 - r0) * i / n, rb = r0 + (r1 - r0) * (i + 1) / n;
+    const float xs[4] = {s0 * ra, s0 * rb, s1 * ra, s1 * rb}, ys[4] = {-c0 * ra, -c0 * rb, -c1 * ra, -c1 * rb};
+    float x1 = xs[0], x2 = xs[0], y1 = ys[0], y2 = ys[0];
+    for (int k = 1; k < 4; k++) { x1 = fminf(x1, xs[k]); x2 = fmaxf(x2, xs[k]); y1 = fminf(y1, ys[k]); y2 = fmaxf(y2, ys[k]); }
+    sink(CX + x1 - pad + fminf(0, shx), CY + y1 - pad + fminf(0, shy), CX + x2 + pad + fmaxf(0, shx), CY + y2 + pad + fmaxf(0, shy));
+  }
 }
 
-static void set_hand_s(const Now& n) {
-  const float a = (n.s + n.ms / 1000.0f) * 6.0f;
-  place_hand(sh_s, a, -52, 246, 8, 12);
-  place_hand(hand_s, a, -52, 246);
-  const float rad = a * (float)M_PI / 180.0f;
-  lv_obj_set_pos(sec_tip, (int)(CX + sinf(rad) * 246) - 11, (int)(CY - cosf(rad) * 246) - 11);
+static void inv_sprite_path(BoxSink sink, float d0, float d1, float r, float half) {
+  const float a0 = d0 * (float)M_PI / 180.0f, a1 = d1 * (float)M_PI / 180.0f;
+  const float x0 = CX + sinf(a0) * r, y0 = CY - cosf(a0) * r, x1 = CX + sinf(a1) * r, y1 = CY - cosf(a1) * r;
+  if (fabsf(d1 - d0) > 3.0f) {
+    sink(x0 - half, y0 - half, x0 + half, y0 + half);
+    sink(x1 - half, y1 - half, x1 + half, y1 + half);
+  } else {
+    sink(fminf(x0, x1) - half, fminf(y0, y1) - half, fmaxf(x0, x1) + half, fmaxf(y0, y1) + half);
+  }
+}
+
+static void draw_hand(lv_layer_t* L, float deg, const HandSpec& h, const Theme& th) {
+  const float a = deg * (float)M_PI / 180.0f, s = sinf(a), c = cosf(a);
+  const float x0 = CX + s * h.r0, y0 = CY - c * h.r0, x1 = CX + s * h.r1, y1 = CY - c * h.r1;
+  d_line(L, x0, y0, x1, y1, (int)h.w, th.ink, LV_OPA_COVER);
+  // a lighter facet along one side makes the hand read as bevelled metal
+  const float fx = c * (-h.w / 4), fy = s * (-h.w / 4);
+  d_line(L, CX + s * 4 + fx, CY - c * 4 + fy, CX + s * (h.r1 - h.w / 2) + fx, CY - c * (h.r1 - h.w / 2) + fy,
+         (int)(h.w / 2), 0xFFFFFF, 70);
+  d_line(L, CX + s * h.lume0, CY - c * h.lume0, CX + s * h.lume1, CY - c * h.lume1, (int)h.lume_w, th.acc1, 235);
+}
+
+static void draw_hand_shadow(lv_layer_t* L, float deg, const HandSpec& h) {
+  const float a = deg * (float)M_PI / 180.0f, s = sinf(a), c = cosf(a);
+  const float x0 = CX + s * h.r0 + SH_DX, y0 = CY - c * h.r0 + SH_DY, x1 = CX + s * h.r1 + SH_DX, y1 = CY - c * h.r1 + SH_DY;
+  if (g_soft_shadows) d_line(L, x0, y0, x1, y1, (int)h.w + 8, 0x000000, 30);   // soft penumbra
+  d_line(L, x0, y0, x1, y1, (int)h.w + 1, 0x000000, 60);   // core
+}
+
+// Everything that lives in the composite, clipped to the layer's current clip area.
+static void comp_draw(lv_layer_t* L) {
+  const Theme& th = THEMES[g_theme];
+  const lv_area_t& cl = L->_clip_area;
+  lv_draw_image_dsc_t img;
+  lv_draw_image_dsc_init(&img);
+  img.src = g_static_bufs[g_theme];
+  const lv_area_t scr = {0, 0, SCR_W - 1, SCR_H - 1};
+  if (img.src) lv_draw_image(L, &img, &scr);
+
+  // Day ring - skipped unless this area actually touches the ring annulus
+  if (g_show_ring) {
+    const float nx = fmaxf(cl.x1 - CX, fminf(0.0f, (float)(cl.x2 - CX))), ny = fmaxf(cl.y1 - CY, fminf(0.0f, (float)(cl.y2 - CY)));
+    const float fx = fmaxf(fabsf(cl.x1 - CX), fabsf(cl.x2 - CX)), fy = fmaxf(fabsf(cl.y1 - CY), fabsf(cl.y2 - CY));
+    if (sqrtf(nx * nx + ny * ny) < R_RING + 24 && sqrtf(fx * fx + fy * fy) > R_RING - 24) {
+      const float deg = g_day_m * 0.25f;
+      if (g_day_m > 0) d_arc(L, CX, CY, (int)R_RING + 3, 6, 270, 270 + deg, th.acc1, LV_OPA_COVER, true);
+      const float a = deg * (float)M_PI / 180.0f;
+      d_sprite(L, spr_knob, CX + sinf(a) * R_RING, CY - cosf(a) * R_RING);
+    }
+  }
+  if (g_show_shadows) {
+    draw_hand_shadow(L, g_ah, HS_H);
+    draw_hand_shadow(L, g_am, HS_M);
+  }
+  draw_hand(L, g_ah, HS_H, th);
+  draw_hand(L, g_am, HS_M, th);
+}
+
+// Re-composite the queued areas (or everything) and invalidate them on screen.
+static void comp_apply() {
+  if (!g_comp_full && !g_comp_n) return;
+  lv_layer_t layer;
+  lv_canvas_init_layer(comp_canvas, &layer);
+  if (g_comp_full) {
+    comp_draw(&layer);
+  } else {
+    for (int i = 0; i < g_comp_n; i++) {
+      layer._clip_area = layer.phy_clip_area = g_comp_box[i];
+      comp_draw(&layer);
+    }
+  }
+  lv_canvas_finish_layer(comp_canvas, &layer);
+  if (g_comp_full) lv_obj_invalidate(bg_img);
+  else for (int i = 0; i < g_comp_n; i++) lv_inv_area(g_disp, &g_comp_box[i]);
+  g_comp_full = false;
+  g_comp_n = 0;
+}
+
+// Per frame, on top of the composite: second hand (with shadow), its lens tip, and the hub.
+static void dial_draw_cb(lv_event_t* e) {
+  lv_layer_t* L = lv_event_get_layer(e);
+  const Theme& th = THEMES[g_theme];
+  const float as = g_as * (float)M_PI / 180.0f, ss = sinf(as), cs = cosf(as);
+  if (g_show_shadows) {
+    d_line(L, CX + ss * S_R0 + SS_DX, CY - cs * S_R0 + SS_DY, CX + ss * S_TAIL + SS_DX, CY - cs * S_TAIL + SS_DY, 9, 0x000000, 60);
+    d_line(L, CX + ss * S_TAIL + SS_DX, CY - cs * S_TAIL + SS_DY, CX + ss * S_R1 + SS_DX, CY - cs * S_R1 + SS_DY, 4, 0x000000, 60);
+  }
+  d_line(L, CX + ss * S_R0, CY - cs * S_R0, CX + ss * S_TAIL, CY - cs * S_TAIL, 8, th.acc2, LV_OPA_COVER);
+  d_line(L, CX + ss * S_TAIL, CY - cs * S_TAIL, CX + ss * S_R1, CY - cs * S_R1, 3, th.acc2, LV_OPA_COVER);
+  d_sprite(L, spr_tip, CX + ss * R_TIP, CY - cs * R_TIP);
+  d_sprite(L, spr_hub, CX, CY);
+}
+
+static void bar_draw_cb(lv_event_t* e) {
+  lv_layer_t* L = lv_event_get_layer(e);
+  const float xe = BAR_X + g_bar * BAR_W;
+  if (xe - BAR_X >= BAR_H) {
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.radius = LV_RADIUS_CIRCLE;
+    d.bg_opa = LV_OPA_COVER;
+    d.bg_grad = g_grad_bar;
+    d.bg_color = g_grad_bar.stops[0].color;
+    const lv_area_t a = {BAR_X, BAR_Y, (int32_t)lroundf(xe), BAR_Y + BAR_H - 1};
+    lv_draw_rect(L, &d, &a);
+  }
+  d_sprite(L, spr_head, xe, BAR_Y + (BAR_H - 1) / 2.0f);
+}
+
+// Move the second hand / seconds bar to `sec` (0..60, fractional)
+static void set_seconds(float sec, bool force) {
+  const float as = sec * 6.0f;
+  if (!force) {
+    inv_hand(inv_box, g_as, as, S_R0, S_R1, 7, SS_DX, SS_DY);
+    inv_sprite_path(inv_box, g_as, as, R_TIP, 33);
+  }
+  g_as = as;
+  const float f = sec / 60.0f;
+  if (!force) {
+    if (f < g_bar) inv_box(BAR_X - 20, BAR_Y - 18, BAR_X + BAR_W + 20, BAR_Y + BAR_H + 18);  // wrapped around
+    else inv_box(BAR_X + g_bar * BAR_W - 20, BAR_Y - 18, BAR_X + f * BAR_W + 20, BAR_Y + BAR_H + 18);
+  }
+  g_bar = f;
+}
+
+static void set_hands_hm(const Now& n, bool hour_too, bool force) {
+  const float min_f = n.mi + n.s / 60.0f;
+  const float am = min_f * 6.0f, ah = ((n.h % 12) + min_f / 60.0f) * 30.0f;
+  if (!force) inv_hand(comp_box, g_am, am, HS_M.r0, HS_M.r1, HS_M.w / 2 + 6, SH_DX, SH_DY);
+  g_am = am;
+  if (hour_too) {
+    if (!force) inv_hand(comp_box, g_ah, ah, HS_H.r0, HS_H.r1, HS_H.w / 2 + 6, SH_DX, SH_DY);
+    g_ah = ah;
+  }
+}
+
+static void set_day_ring(int m, bool force) {
+  if (m == g_day_m && !force) return;
+  if (!force) {
+    if (m < g_day_m) g_comp_full = true;   // midnight: the ring empties
+    else inv_sprite_path(comp_box, g_day_m * 0.25f, m * 0.25f, R_RING, 24);
+  }
+  g_day_m = m;
 }
 
 static void apply_dynamic_theme() {
   const Theme& th = THEMES[g_theme];
-  lv_obj_set_style_line_color(lume_h.o, lv_color_hex(th.acc1), 0);
-  lv_obj_set_style_line_color(lume_m.o, lv_color_hex(th.acc1), 0);
-  lv_obj_set_style_line_color(hand_s.o, lv_color_hex(th.acc2), 0);
-  lv_obj_set_style_bg_color(sec_tip, lv_color_hex(th.acc2), 0);
-  lv_obj_set_style_shadow_color(sec_tip, lv_color_hex(th.acc2), 0);
-  lv_obj_set_style_bg_color(hub_in, lv_color_hex(th.acc2), 0);
-  lv_obj_set_style_arc_color(day_arc, lv_color_hex(th.acc1), LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(day_arc, lv_color_hex(th.acc1), LV_PART_KNOB);
-  lv_obj_set_style_shadow_color(day_arc, lv_color_hex(th.acc1), LV_PART_KNOB);
-  lv_obj_set_style_bg_color(bar_sec, lv_color_hex(th.acc1), LV_PART_INDICATOR);
-  lv_obj_set_style_bg_grad_color(bar_sec, lv_color_hex(th.acc2), LV_PART_INDICATOR);
+  make_sprites(th);
+  const uint32_t c[2] = {th.acc1, th.acc2};
+  const lv_opa_t o[2] = {LV_OPA_COVER, LV_OPA_COVER};
+  set_grad(&g_grad_bar, 2, c, o, LV_GRAD_DIR_HOR);
   lv_obj_set_style_text_color(lbl_greet, lv_color_hex(th.acc1), 0);
+  lv_obj_set_style_text_color(lbl_time, lv_color_hex(th.ink), 0);
+  lv_obj_set_style_text_color(lbl_date, lv_color_hex(th.ink), 0);
+  lv_obj_set_style_text_color(lbl_batt, lv_color_hex(th.ink), 0);
   lv_obj_set_style_text_color(lbl_ampm, lv_color_hex(th.acc2), 0);
   lv_obj_set_style_text_color(lbl_sec, lv_color_hex(th.acc2), 0);
   lv_obj_set_style_bg_color(today_mark, lv_color_hex(th.acc1), 0);
   lv_obj_set_style_shadow_color(today_mark, lv_color_hex(th.acc1), 0);
+  lv_obj_set_style_bg_color(week_mark, lv_color_hex(th.acc1), 0);
   lv_obj_set_style_text_color(lbl_month, lv_color_hex(th.acc1), 0);
+  for (int c = 0; c < 7; c++) {
+    const bool we = c == 0 || c == 6;
+    lv_obj_set_style_text_color(lbl_wd[c], lv_color_hex(we ? th.acc2 : th.ink), 0);
+  }
 }
 
 static void build_dynamic_ui() {
@@ -680,82 +1270,30 @@ static void build_dynamic_ui() {
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
+  g_comp = lv_draw_buf_create(SCR_W, SCR_H, LV_COLOR_FORMAT_RGB565, 0);
+  comp_canvas = lv_canvas_create(lv_layer_bottom());
+  lv_obj_add_flag(comp_canvas, LV_OBJ_FLAG_HIDDEN);
+  lv_canvas_set_draw_buf(comp_canvas, g_comp);
   bg_img = lv_image_create(scr);
+  lv_image_set_src(bg_img, g_comp);
   lv_obj_set_pos(bg_img, 0, 0);
 
-  // Day-progress ring with a glowing knob
-  day_arc = lv_arc_create(scr);
-  lv_obj_remove_style_all(day_arc);
-  lv_obj_set_size(day_arc, 660, 660);
-  lv_obj_set_pos(day_arc, CX - 330, CY - 330);
-  lv_obj_remove_flag(day_arc, LV_OBJ_FLAG_CLICKABLE);
-  lv_arc_set_rotation(day_arc, 270);
-  lv_arc_set_bg_angles(day_arc, 0, 360);
-  lv_arc_set_range(day_arc, 0, 1440);
-  lv_arc_set_value(day_arc, 0);
-  lv_obj_set_style_arc_width(day_arc, 6, LV_PART_MAIN);
-  lv_obj_set_style_arc_color(day_arc, lv_color_white(), LV_PART_MAIN);
-  lv_obj_set_style_arc_opa(day_arc, LV_OPA_10, LV_PART_MAIN);
-  lv_obj_set_style_arc_width(day_arc, 6, LV_PART_INDICATOR);
-  lv_obj_set_style_arc_rounded(day_arc, true, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_opa(day_arc, LV_OPA_COVER, LV_PART_KNOB);
-  lv_obj_set_style_radius(day_arc, LV_RADIUS_CIRCLE, LV_PART_KNOB);
-  lv_obj_set_style_pad_all(day_arc, 6, LV_PART_KNOB);
-  lv_obj_set_style_shadow_width(day_arc, 24, LV_PART_KNOB);
-  lv_obj_set_style_shadow_opa(day_arc, LV_OPA_70, LV_PART_KNOB);
+  dial_obj = mk(scr, CX - 345, CY - 345, 690, 690);
+  lv_obj_add_event_cb(dial_obj, dial_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+  secbar_obj = mk(scr, BAR_X - 20, BAR_Y - 18, BAR_W + 40, BAR_H + 36);
+  lv_obj_add_event_cb(secbar_obj, bar_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
 
-  // Hands
-  make_line(sh_h, scr, 20, 0x000000, LV_OPA_40);
-  make_line(sh_m, scr, 14, 0x000000, LV_OPA_40);
-  make_line(sh_s, scr, 5, 0x000000, LV_OPA_30);
-  make_line(hand_h, scr, 18, 0xF4F6FF, LV_OPA_COVER);
-  make_line(lume_h, scr, 6, 0xFFFFFF, LV_OPA_COVER);
-  make_line(hand_m, scr, 12, 0xF4F6FF, LV_OPA_COVER);
-  make_line(lume_m, scr, 4, 0xFFFFFF, LV_OPA_COVER);
-  make_line(hand_s, scr, 4, 0xFFFFFF, LV_OPA_COVER);
-
-  sec_tip = mk(scr, 0, 0, 22, 22);
-  lv_obj_set_style_radius(sec_tip, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(sec_tip, LV_OPA_COVER, 0);
-  lv_obj_set_style_shadow_width(sec_tip, 22, 0);
-  lv_obj_set_style_shadow_opa(sec_tip, LV_OPA_60, 0);
-
-  lv_obj_t* hub = hub_obj = mk(scr, CX - 19, CY - 19, 38, 38);
-  lv_obj_set_style_radius(hub, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(hub, lv_color_hex(0xF4F6FF), 0);
-  lv_obj_set_style_bg_opa(hub, LV_OPA_COVER, 0);
-  lv_obj_set_style_shadow_width(hub, 14, 0);
-  lv_obj_set_style_shadow_opa(hub, LV_OPA_40, 0);
-  lv_obj_set_style_shadow_color(hub, lv_color_black(), 0);
-  lv_obj_set_style_shadow_offset_y(hub, 4, 0);
-  hub_in = mk(scr, CX - 8, CY - 8, 16, 16);
-  lv_obj_set_style_radius(hub_in, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(hub_in, LV_OPA_COVER, 0);
-
-  // Right-hand panel: greeting, time, date, seconds bar
+  // Right-hand panel: greeting, time, date, seconds
   lbl_greet = mk_label(scr, f_head, 0xFFFFFF, LV_OPA_COVER, "", PX + 4, 30, 400);
   lv_obj_set_style_text_letter_space(lbl_greet, 5, 0);
   lv_obj_set_width(lbl_greet, 330);  // keep clear of the WiFi/battery icons on the right
-  lbl_batt = mk_label(scr, &lv_font_montserrat_20, 0xFFFFFF, LV_OPA_70, "", PX + PW - 190, 34, 190, LV_TEXT_ALIGN_RIGHT);
-
-  lbl_wifi = mk_label(scr, &lv_font_montserrat_20, 0xFFFFFF, LV_OPA_30, LV_SYMBOL_WIFI, PX + PW - 172, 34, 40);
+  lbl_batt = mk_label(scr, &lv_font_montserrat_20, 0xFFFFFF, 190, "", PX + PW - 190, 36, 180, LV_TEXT_ALIGN_RIGHT);
+  lbl_wifi = mk_label(scr, &lv_font_montserrat_20, 0xFFFFFF, LV_OPA_30, LV_SYMBOL_WIFI, PX + PW - 170, 36, 40);
 
   lbl_time = mk_label(scr, f_digits, 0xFFFFFF, LV_OPA_COVER, "00:00", PX - 6, 36, 470);
   lbl_ampm = mk_label(scr, f_sec, 0xFFFFFF, LV_OPA_COVER, "", PX + PW - 60, 104, 70);
-  lbl_date = mk_label(scr, f_date, 0xFFFFFF, LV_OPA_90, "", PX + 4, 252, PW);
+  lbl_date = mk_label(scr, f_date, 0xFFFFFF, 235, "", PX + 4, 252, PW);
   lbl_sec = mk_label(scr, f_small, 0xFFFFFF, LV_OPA_COVER, "", PX + PW - 90, 322, 90, LV_TEXT_ALIGN_RIGHT);
-
-  bar_sec = lv_bar_create(scr);
-  lv_obj_remove_style_all(bar_sec);
-  lv_obj_set_pos(bar_sec, PX + 4, 334);
-  lv_obj_set_size(bar_sec, PW - 110, 8);
-  lv_bar_set_range(bar_sec, 0, 60000);
-  lv_obj_set_style_radius(bar_sec, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(bar_sec, lv_color_white(), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(bar_sec, LV_OPA_20, LV_PART_MAIN);
-  lv_obj_set_style_radius(bar_sec, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_opa(bar_sec, LV_OPA_COVER, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_grad_dir(bar_sec, LV_GRAD_DIR_HOR, LV_PART_INDICATOR);
 
   // Calendar
   lbl_month = mk_label(scr, f_head, 0xFFFFFF, LV_OPA_COVER, "", PX + 26, 408, PW - 52);
@@ -763,13 +1301,18 @@ static void build_dynamic_ui() {
   const int cw = (PW - 40) / 7, gx = PX + 20;
   const char* wd_short[7] = {"S", "M", "T", "W", "T", "F", "S"};
   for (int c = 0; c < 7; c++)
-    lbl_wd[c] = mk_label(scr, f_small, 0xFFFFFF, LV_OPA_50, wd_short[c], gx + c * cw, 452, cw, LV_TEXT_ALIGN_CENTER);
+    lbl_wd[c] = mk_label(scr, f_small, 0xFFFFFF, 150, wd_short[c], gx + c * cw, 452, cw, LV_TEXT_ALIGN_CENTER);
 
-  today_mark = mk(scr, 0, 0, 32, 32);
+  week_mark = mk(scr, gx + 2, 0, 7 * cw - 4, 32);   // translucent band behind the current week
+  lv_obj_set_style_radius(week_mark, 16, 0);
+  lv_obj_set_style_bg_opa(week_mark, 30, 0);
+  lv_obj_add_flag(week_mark, LV_OBJ_FLAG_HIDDEN);
+
+  today_mark = mk(scr, 0, 0, 34, 34);
   lv_obj_set_style_radius(today_mark, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_opa(today_mark, LV_OPA_COVER, 0);
-  lv_obj_set_style_shadow_width(today_mark, 18, 0);
-  lv_obj_set_style_shadow_opa(today_mark, LV_OPA_50, 0);
+  lv_obj_set_style_shadow_width(today_mark, 20, 0);
+  lv_obj_set_style_shadow_opa(today_mark, LV_OPA_60, 0);
   lv_obj_add_flag(today_mark, LV_OBJ_FLAG_HIDDEN);
 
   for (int i = 0; i < 42; i++)
@@ -793,6 +1336,7 @@ static void update_calendar(const Now& n) {
   const int pdim = days_in_month(py, pm);
 
   lv_obj_add_flag(today_mark, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(week_mark, LV_OBJ_FLAG_HIDDEN);
   for (int i = 0; i < 42; i++) {
     int day = i - first + 1;
     const bool in_month = day >= 1 && day <= dim;
@@ -804,23 +1348,22 @@ static void update_calendar(const Now& n) {
     const bool weekend = (i % 7 == 0) || (i % 7 == 6);
     lv_obj_t* l = lbl_day[i];
     if (!in_month) {
-      lv_obj_set_style_text_color(l, lv_color_white(), 0);
-      lv_obj_set_style_text_opa(l, LV_OPA_20, 0);
+      lv_obj_set_style_text_color(l, lv_color_hex(th.ink), 0);
+      lv_obj_set_style_text_opa(l, 56, 0);
     } else if (day == n.d) {
       lv_obj_set_style_text_color(l, lv_color_hex(th.bg_top), 0);
       lv_obj_set_style_text_opa(l, LV_OPA_COVER, 0);
       lv_obj_update_layout(l);
-      lv_obj_set_pos(today_mark, lv_obj_get_x(l) + lv_obj_get_width(l) / 2 - 16,
-                     lv_obj_get_y(l) + lv_obj_get_height(l) / 2 - 16);
+      const int cy = lv_obj_get_y(l) + lv_obj_get_height(l) / 2;
+      lv_obj_set_pos(today_mark, lv_obj_get_x(l) + lv_obj_get_width(l) / 2 - 17, cy - 17);
       lv_obj_remove_flag(today_mark, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_y(week_mark, cy - 16);
+      lv_obj_remove_flag(week_mark, LV_OBJ_FLAG_HIDDEN);
     } else {
-      lv_obj_set_style_text_color(l, weekend ? lv_color_hex(th.acc2) : lv_color_white(), 0);
-      lv_obj_set_style_text_opa(l, weekend ? LV_OPA_90 : LV_OPA_80, 0);
+      lv_obj_set_style_text_color(l, lv_color_hex(weekend ? th.acc2 : th.ink), 0);
+      lv_obj_set_style_text_opa(l, weekend ? 240 : 215, 0);
     }
   }
-  // keep the marker underneath its number
-  lv_obj_move_foreground(today_mark);
-  for (int i = 0; i < 42; i++) lv_obj_move_foreground(lbl_day[i]);
 }
 
 static void update_date(const Now& n) {
@@ -830,7 +1373,7 @@ static void update_date(const Now& n) {
   update_calendar(n);
 }
 
-static void update_minute(const Now& n) {
+static void update_minute(const Now& n, bool force) {
   char buf[16];
   if (g_24h) {
     snprintf(buf, sizeof(buf), "%02d:%02d", n.h, n.mi);
@@ -841,7 +1384,7 @@ static void update_minute(const Now& n) {
     lv_obj_remove_flag(lbl_ampm, LV_OBJ_FLAG_HIDDEN);
   }
   lv_label_set_text(lbl_time, buf);
-  lv_arc_set_value(day_arc, n.h * 60 + n.mi);
+  set_day_ring(n.h * 60 + n.mi, force);
 
   const char* g = n.h < 5 ? "GOOD NIGHT" : n.h < 12 ? "GOOD MORNING" : n.h < 18 ? "GOOD AFTERNOON" : "GOOD EVENING";
   lv_label_set_text(lbl_greet, g);
@@ -854,7 +1397,7 @@ static void update_battery() {
   const int lvl = M5.Power.getBatteryLevel();
   // WiFi icon: bright in the accent colour while the time is NTP-synced, dim otherwise (tap it to set up WiFi)
   const bool synced = ntp_active();
-  lv_obj_set_style_text_color(lbl_wifi, lv_color_hex(synced ? THEMES[g_theme].acc1 : 0xFFFFFF), 0);
+  lv_obj_set_style_text_color(lbl_wifi, lv_color_hex(synced ? THEMES[g_theme].acc1 : THEMES[g_theme].ink), 0);
   lv_obj_set_style_text_opa(lbl_wifi, synced ? LV_OPA_COVER : LV_OPA_30, 0);
   if (lvl < 0) { lv_label_set_text(lbl_batt, ""); return; }
   const char* icon = lvl > 85 ? LV_SYMBOL_BATTERY_FULL : lvl > 60 ? LV_SYMBOL_BATTERY_3 : lvl > 35 ? LV_SYMBOL_BATTERY_2
@@ -895,22 +1438,32 @@ static void fast_cb(lv_timer_t*) {
   static int last_s = -1, last_mi = -1, last_d = -1;
   const Now n = now_local();
 
-  set_hand_s(n);
-  lv_bar_set_value(bar_sec, n.s * 1000 + n.ms, LV_ANIM_OFF);
-
   const bool force = g_dirty_all;
-  if (g_dirty_all) { last_s = last_mi = last_d = -1; g_dirty_all = false; }
+  if (force) {
+    last_s = last_mi = last_d = -1;
+    g_dirty_all = false;
+    g_comp_full = true;
+    lv_obj_invalidate(secbar_obj);
+  }
+  set_seconds(n.s + n.ms / 1000.0f, force);
   if (n.s != last_s) {
     last_s = n.s;
-    // The hour/minute hands move well under a pixel per second; repainting them (plus shadows) every second
-    // costs more than a frame, so step the minute hand every 3 s and the hour hand every 30 s.
-    if (force || n.s % 3 == 0) set_hands_hm(n, force || n.s % 30 == 0);
+    // The hour/minute hands move well under a pixel per second: step the minute hand every 3 s and the hour
+    // hand every 30 s.
+    if (force || n.s % 3 == 0) set_hands_hm(n, force || n.s % 30 == 0, force);
     char b[8];
     snprintf(b, sizeof(b), "%02d s", n.s);
     lv_label_set_text(lbl_sec, b);
   }
-  if (n.mi != last_mi) { last_mi = n.mi; update_minute(n); }
+  if (n.mi != last_mi) { last_mi = n.mi; update_minute(n, force); }
   if (n.d != last_d) { last_d = n.d; update_date(n); }
+  comp_apply();
+}
+
+// Finish the themes whose backgrounds paint_task has painted (at most one per call).
+static void render_pending_themes() {
+  for (int i = 0; i < N_THEMES; i++)
+    if (g_painted[i]) { uint32_t* px = g_painted[i]; render_static(i, px); g_painted[i] = nullptr; return; }
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -920,6 +1473,7 @@ static void fast_cb(lv_timer_t*) {
 static lv_obj_t *wifi_ui, *wl_list, *wl_status, *wl_page_list, *wl_page_pw, *wl_ta, *wl_kb, *wl_pw_title;
 static lv_obj_t *wl_btn_a_lbl, *wl_btn_connect, *wl_btn_show_lbl;
 static lv_timer_t *g_fast_timer = nullptr, *g_wifi_timer = nullptr;
+static lv_indev_t *g_indev = nullptr;          // LVGL touch input, only polled while the WiFi screen is open
 static bool    g_wifi_open = false;
 static int     g_wl_page = 0;                 // 0 = network list, 1 = password entry
 static int     g_wl_count_at_connect = -1;    // g_ntp_count when the user pressed Connect (-1 = not waiting)
@@ -962,6 +1516,7 @@ static void wifi_close() {
   g_wifi_open = false;
   lv_obj_add_flag(wifi_ui, LV_OBJ_FLAG_HIDDEN);
   lv_timer_pause(g_wifi_timer);
+  lv_timer_pause(lv_indev_get_read_timer(g_indev));
   lv_timer_resume(g_fast_timer);
   g_dirty_all = true;
   lv_obj_invalidate(lv_screen_active());
@@ -1088,6 +1643,7 @@ static void wifi_open() {
   lv_obj_remove_flag(wifi_ui, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(wifi_ui);
   lv_timer_resume(g_wifi_timer);
+  lv_timer_resume(lv_indev_get_read_timer(g_indev));
   g_net_cmd = 2;  // scan right away
 }
 
@@ -1271,6 +1827,27 @@ static void send_screenshot() {
   lv_draw_buf_destroy(snap);
 }
 
+// Same format as "P", but read back from the panel's frame buffer (what is really on the glass), rotated back
+// to landscape - verifies the PPA flush path.
+static void send_fb_screenshot() {
+  if (!g_fb) { Serial.println("SNAPFAIL"); return; }
+  esp_cache_msync(g_fb, FB_W * FB_H * 2, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+  Serial.printf("SNAP %d %d\n", SCR_W, SCR_H);
+  static uint16_t row[SCR_W];
+  for (int y = 0; y < SCR_H; y++) {
+    for (int x = 0; x < SCR_W; x++)
+      row[x] = ROTATION == 1 ? g_fb[x * FB_W + (FB_W - 1 - y)] : g_fb[(FB_H - 1 - x) * FB_W + y];
+    size_t off = 0;
+    const uint8_t* p = (const uint8_t*)row;
+    while (off < sizeof(row)) {
+      const size_t k = Serial.write(p + off, min<size_t>(sizeof(row) - off, 512));
+      if (k == 0) delay(1);
+      off += k;
+    }
+  }
+  Serial.print("\nENDSNAP\n");
+}
+
 static void handle_serial() {
   static char line[192];
   static size_t len = 0;
@@ -1345,6 +1922,12 @@ static void handle_serial() {
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)g_flush_n,
                       g_flush_n ? g_flush_us / g_flush_n : 0, g_flush_px ? (uint32_t)((uint64_t)g_flush_us * 1000 / g_flush_px) : 0);
+        {
+          const int64_t win = esp_timer_get_time() - g_stat_t0;
+          Serial.printf("cpu busy %.1f%% | %.1f fps over %.1f s\n", win ? 100.0 * g_busy_us / win : 0.0,
+                        win ? g_frames * 1e6 / win : 0.0, win / 1e6);
+          g_busy_us = 0; g_frames = 0; g_stat_t0 = esp_timer_get_time();
+        }
         g_flush_us = g_flush_px = g_flush_n = 0;
         Serial.printf("max ms: update=%u touch=%u rtc=%u serial=%u lvgl=%u | >50ms: %u %u %u %u %u | rtc corr=%d maxjump=%dms reject=%d\n",
                       st_upd.max_us / 1000, st_tap.max_us / 1000, st_rtc.max_us / 1000, st_ser.max_us / 1000,
@@ -1360,16 +1943,17 @@ static void handle_serial() {
         break;
       }
       case 'K': g_auto_left = 20; g_auto_next = mono_ms() + 1000; Serial.println("OK stress: 20 theme switches / 3 s"); break;
-      case 'H': {  // debug: bitmask of things to disable: 1 arc, 2 hand shadows, 4 tip glow, 8 hub shadow
+      case 'H': {  // debug: bitmask of things to disable: 1 day ring, 2 hand shadows, 4 soft shadow penumbra
         const int m = atoi(line + 1);
-        if (m & 1) lv_obj_add_flag(day_arc, LV_OBJ_FLAG_HIDDEN); else lv_obj_remove_flag(day_arc, LV_OBJ_FLAG_HIDDEN);
-        LineObj* sh[3] = {&sh_h, &sh_m, &sh_s};
-        for (auto* l : sh) { if (m & 2) lv_obj_add_flag(l->o, LV_OBJ_FLAG_HIDDEN); else lv_obj_remove_flag(l->o, LV_OBJ_FLAG_HIDDEN); }
-        lv_obj_set_style_shadow_width(sec_tip, (m & 4) ? 0 : 22, 0);
-        lv_obj_set_style_shadow_width(hub_obj, (m & 8) ? 0 : 14, 0);
+        g_show_ring = !(m & 1);
+        g_show_shadows = !(m & 2);
+        g_soft_shadows = !(m & 4);
+        g_comp_full = true;
+        lv_obj_invalidate(dial_obj);
         Serial.printf("OK mask %d\n", m);
         break;
       }
+      case 'F': send_fb_screenshot(); break;
       default: Serial.println("ERR unknown command"); break;
     }
   }
@@ -1463,6 +2047,8 @@ void setup() {
   M5.begin(cfg);
   M5.Display.setRotation(ROTATION);
   M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.display();
+  ppa_setup();
   Serial.printf("\nFancy clock: display %dx%d, PSRAM %u bytes free\n", (int)M5.Display.width(), (int)M5.Display.height(),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
@@ -1501,18 +2087,20 @@ void setup() {
   f_num    = lv_tiny_ttf_create_data(font_medium_data, font_medium_size, 46);
   f_cal    = lv_tiny_ttf_create_data(font_medium_data, font_medium_size, 24);
   f_small  = lv_tiny_ttf_create_data(font_medium_data, font_medium_size, 22);
+  f_tiny   = lv_tiny_ttf_create_data(font_medium_data, font_medium_size, 16);
 
   build_dynamic_ui();
   wifi_build();
   bri_build();
-  lv_indev_t* indev = lv_indev_create();
-  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
-  lv_indev_set_read_cb(indev, touch_read_cb);
-  lv_timer_set_period(lv_indev_get_read_timer(indev), 16);
-  for (int i = 0; i < N_THEMES; i++) render_static(i);  // ~0.3 s each, makes theme switches instant
-  set_theme(g_theme, false);
+  g_indev = lv_indev_create();
+  lv_indev_set_type(g_indev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(g_indev, touch_read_cb);
+  lv_timer_set_period(lv_indev_get_read_timer(g_indev), 16);
+  lv_timer_pause(lv_indev_get_read_timer(g_indev));   // resumed while the WiFi screen is open
+  set_theme(g_theme, false);                          // the other themes are rendered in the background later
+  xTaskCreatePinnedToCore(paint_task, "paint", 4096, nullptr, 0, nullptr, 0);
   update_battery();
-  g_fast_timer = lv_timer_create(fast_cb, 33, nullptr);
+  g_fast_timer = lv_timer_create(fast_cb, FRAME_MS, nullptr);
   lv_timer_create([](lv_timer_t*) { update_battery(); }, 20000, nullptr);
   // the fuel gauge can report 0% right after power-up, so read it again shortly after boot
   lv_timer_set_repeat_count(lv_timer_create([](lv_timer_t*) { update_battery(); }, 3000, nullptr), 1);
@@ -1530,9 +2118,10 @@ void loop() {
     return;
   }
   int64_t t = esp_timer_get_time();
+  const int64_t t_loop = t;
   M5.update();          stat_add(st_upd, t); t = esp_timer_get_time();
   handle_touch();       stat_add(st_tap, t); t = esp_timer_get_time();
-  poll_rtc();           stat_add(st_rtc, t); t = esp_timer_get_time();
+  const bool rtc_busy = poll_rtc(); stat_add(st_rtc, t); t = esp_timer_get_time();
   handle_serial();      stat_add(st_ser, t); t = esp_timer_get_time();
   bri_tick();
   net_apply();
@@ -1546,11 +2135,16 @@ void loop() {
     g_auto_next = mono_ms() + 3000;
     set_theme(g_theme + 1, false);
   }
-  lv_timer_handler();   stat_add(st_lv, t);
+  const uint32_t idle_ms = lv_timer_handler();   stat_add(st_lv, t);
   {
     const int pos = now_local().s / 5;
     g_frames_by_pos[pos]++;
     if (esp_timer_get_time() - t > 40000) g_slow_by_pos[pos]++;
   }
-  delay(2);
+  if (!g_wifi_open) render_pending_themes();
+  g_busy_us += esp_timer_get_time() - t_loop;
+  // Sleep until LVGL's next timer is due (the idle task halts the CPU meanwhile), but wake every TOUCH_MS to
+  // poll the touch panel, and every 4 ms while phase-locking to the RTC.
+  uint32_t ms = min<uint32_t>(idle_ms, rtc_busy ? 4 : TOUCH_MS);
+  delay(ms ? ms : 1);
 }
