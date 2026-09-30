@@ -475,6 +475,9 @@ static lv_grad_dsc_t g_grad_card, g_grad_sheen, g_grad_bar;
 
 // Geometry of the moving parts
 static constexpr float R_RING = 327;          // day-progress ring centre line (6 px wide)
+// lv_draw_arc covers center-r .. center+r-1, i.e. the arc's true centre is half a pixel up-left of (CX, CY);
+// everything belonging to the day ring (track, dots, knob) is centred there so nothing peeks out from under it.
+static constexpr float RCX = CX - 0.5f, RCY = CY - 0.5f;
 static constexpr float R_TIP  = 246;          // centre of the second hand's lens tip
 static constexpr float SEG = 36;              // length of the dirty-rectangle pieces along a hand
 static constexpr int BAR_X = PX + 4, BAR_Y = 334, BAR_W = PW - 110, BAR_H = 8;
@@ -779,7 +782,10 @@ static HOT void dial_at(const DialCols& dc, float x, float y, float* c) {
   if (fabsf(d - 131) < 2) a += 0.18f * ring_at(d, 131, 2);
   if (fabsf(d - 268) < 1.5f) a += 0.16f * ring_at(d, 268, 1);
   if (fabsf(d - 288) < 1.5f) a += 0.16f * ring_at(d, 288, 1);
-  if (fabsf(d - R_RING) < 4) a += 0.09f * ring_at(d, R_RING, 6);
+  if (fabsf(d - R_RING) < 5) {
+    const float rx = x - RCX, ry = y - RCY, dr = sqrtf(rx * rx + ry * ry);
+    a += 0.09f * ring_at(dr, R_RING, 6);
+  }
   if (fabsf(d - 301.5f) < 3.5f) {                                     // glass bezel: lit top edge, shaded bottom edge
     const float up = -dy / d;
     a += 0.12f * ring_at(d, 301, 3);
@@ -880,9 +886,9 @@ static void dial_deco_cb(lv_event_t* e) {
   }
   for (int h = 0; h < 24; h++) {                          // hour dots on the day-ring track
     const float a = h * 15.0f * (float)M_PI / 180.0f;
-    const float x = CX + sinf(a) * R_RING, y = CY - cosf(a) * R_RING;
-    if (h % 6 == 0) d_disc(L, x, y, 3.5f, th.acc1, 230);
-    else d_disc(L, x, y, 1.8f, th.ink, 120);
+    const float x = RCX + sinf(a) * R_RING, y = RCY - cosf(a) * R_RING;
+    if (h % 6 == 0) d_disc(L, x, y, 3.0f, th.acc1, 230);   // 6 px: exactly the arc's width, hidden once passed
+    else d_disc(L, x, y, 2.0f, th.ink, 110);
   }
 }
 
@@ -1143,7 +1149,7 @@ static void comp_draw(lv_layer_t* L) {
       const float deg = g_day_m * 0.25f;
       if (g_day_m > 0) d_arc(L, CX, CY, (int)R_RING + 3, 6, 270, 270 + deg, th.acc1, LV_OPA_COVER, true);
       const float a = deg * (float)M_PI / 180.0f;
-      d_sprite(L, spr_knob, CX + sinf(a) * R_RING, CY - cosf(a) * R_RING);
+      d_sprite(L, spr_knob, RCX + sinf(a) * R_RING, RCY - cosf(a) * R_RING);
     }
   }
   if (g_show_shadows) {
