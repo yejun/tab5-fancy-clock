@@ -1163,6 +1163,76 @@ static void wifi_build() {
 }
 
 // ----------------------------------------------------------------------------------------------
+// Display power & brightness: swipe left/right to dim/brighten, double-tap to turn the display off/on.
+// ----------------------------------------------------------------------------------------------
+static constexpr int MIN_BRIGHTNESS = 8;   // never fully black by swiping, so the screen can't be "lost"
+static uint8_t g_bri = BRIGHTNESS;
+static bool    g_disp_on = true;
+static int64_t g_bri_hide_at = 0;
+static lv_obj_t *bri_ui, *bri_lbl, *bri_bar;
+
+static void bri_build() {
+  bri_ui = mk(lv_layer_top(), (SCR_W - 460) / 2, SCR_H - 96 - 40, 460, 96);
+  lv_obj_set_style_radius(bri_ui, 30, 0);
+  lv_obj_set_style_bg_color(bri_ui, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(bri_ui, LV_OPA_70, 0);
+  lv_obj_set_style_border_width(bri_ui, 1, 0);
+  lv_obj_set_style_border_color(bri_ui, lv_color_white(), 0);
+  lv_obj_set_style_border_opa(bri_ui, LV_OPA_30, 0);
+  lv_obj_add_flag(bri_ui, LV_OBJ_FLAG_HIDDEN);
+  bri_lbl = mk_label(bri_ui, &lv_font_montserrat_20, 0xFFFFFF, LV_OPA_COVER, "", 0, 18, 460, LV_TEXT_ALIGN_CENTER);
+  bri_bar = lv_bar_create(bri_ui);
+  lv_obj_remove_style_all(bri_bar);
+  lv_obj_set_pos(bri_bar, 40, 60);
+  lv_obj_set_size(bri_bar, 380, 10);
+  lv_bar_set_range(bri_bar, MIN_BRIGHTNESS, 255);
+  lv_obj_set_style_radius(bri_bar, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(bri_bar, lv_color_white(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(bri_bar, LV_OPA_30, LV_PART_MAIN);
+  lv_obj_set_style_radius(bri_bar, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(bri_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+}
+
+static void set_brightness(int v, bool show) {
+  v = constrain(v, MIN_BRIGHTNESS, 255);
+  const bool changed = v != g_bri;
+  g_bri = (uint8_t)v;
+  if (g_disp_on) M5.Display.setBrightness(g_bri);
+  if (show && (changed || lv_obj_has_flag(bri_ui, LV_OBJ_FLAG_HIDDEN))) {
+    char b[32];
+    snprintf(b, sizeof(b), "Brightness  %d%%", (g_bri * 100 + 127) / 255);
+    lv_label_set_text(bri_lbl, b);
+    lv_obj_set_style_bg_color(bri_bar, lv_color_hex(THEMES[g_theme].acc1), LV_PART_INDICATOR);
+    lv_bar_set_value(bri_bar, g_bri, LV_ANIM_OFF);
+    lv_obj_remove_flag(bri_ui, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(bri_ui);
+    g_bri_hide_at = 0;  // stays up while adjusting; hidden shortly after the finger lifts
+  }
+}
+
+static void bri_tick() {
+  if (g_bri_hide_at && mono_ms() >= g_bri_hide_at) {
+    g_bri_hide_at = 0;
+    lv_obj_add_flag(bri_ui, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// "Off" = backlight 0 and no animation work; the clock keeps its time in the background.
+static void display_set(bool on) {
+  if (on == g_disp_on) return;
+  g_disp_on = on;
+  if (on) {
+    M5.Display.setBrightness(g_bri);
+    lv_timer_resume(g_fast_timer);
+    g_dirty_all = true;
+  } else {
+    M5.Display.setBrightness(0);
+    lv_timer_pause(g_fast_timer);
+  }
+  Serial.printf("display %s\n", on ? "on" : "off");
+}
+
+// ----------------------------------------------------------------------------------------------
 // Serial console (time sync, screenshots, debugging)
 // ----------------------------------------------------------------------------------------------
 static void send_screenshot() {
@@ -1232,6 +1302,8 @@ static void handle_serial() {
       }
       case 'U': if (g_wifi_open) wifi_close(); else wifi_open(); Serial.printf("OK wifi screen %s\n", g_wifi_open ? "open" : "closed"); break;
       case 'Y': wl_select(atoi(line + 1)); Serial.println("OK select"); break;  // test: pick scan result n
+      case 'B': set_brightness(atoi(line + 1), true); g_bri_hide_at = mono_ms() + 60000; Serial.printf("OK brightness %d\n", g_bri); break;  // test: B <8-255>
+      case 'D': display_set(!g_disp_on); Serial.printf("OK display %s\n", g_disp_on ? "on" : "off"); break;              // test: toggle display
       case 'N': g_net_cmd = 1; Serial.println("OK syncing"); break;
       case 'Q': g_net_cmd = 2; Serial.println("OK scanning"); break;
       case 'P': send_screenshot(); break;
@@ -1296,25 +1368,69 @@ static void touch_read_cb(lv_indev_t*, lv_indev_data_t* d) {
   d->point.y = ly;
 }
 
-static void handle_touch() {
-  const auto t = M5.Touch.getDetail();
-  if (g_wifi_open || !t.wasClicked()) return;  // the WiFi screen is driven by LVGL's own input device
-  static int64_t last_tap = 0;
-  const int64_t now = mono_ms();
-  const bool bounce = now - last_tap < 700;
-  const bool drag = abs(t.distanceX()) > 40 || abs(t.distanceY()) > 40;
-  Serial.printf("click x=%d y=%d drag=(%d,%d) +%lldms -> %s\n", (int)t.x, (int)t.y, t.distanceX(), t.distanceY(),
-                (long long)(now - last_tap), bounce ? "ignored (bounce)" : drag ? "ignored (drag)" : "tap");
-  if (bounce || drag) return;
-  last_tap = now;
-  if (t.x >= PX + PW - 260 && t.y < 90) {           // top-right corner (WiFi icon / battery)
+// A confirmed single tap on the clock face.
+static void run_tap(int x, int y) {
+  if (x >= PX + PW - 260 && y < 90) {               // top-right corner (WiFi icon / battery)
     wifi_open();
-  } else if (t.x >= PX && t.y < 250) {
+  } else if (x >= PX && y < 250) {                  // the big digits
     g_24h = !g_24h;
     prefs.putBool("h24", g_24h);
     g_dirty_all = true;
   } else {
     set_theme(g_theme + 1);
+  }
+}
+
+// Gestures on the clock face (the WiFi screen is driven by LVGL's own input device instead):
+//   horizontal drag  -> brightness      double tap -> display off/on      single tap -> run_tap()
+// A single tap is only acted on after the double-tap window has passed without a second tap.
+static void handle_touch() {
+  static constexpr int64_t DOUBLE_TAP_MS = 350;
+  static bool down = false, adjusting = false, pending = false;
+  static int sx, sy, lx, ly, px, py;
+  static int64_t t_down = 0, pend_at = 0, ignore_until = 0;
+  static uint8_t bri0 = 0;
+
+  const int64_t now = mono_ms();
+  const auto t = M5.Touch.getDetail();
+  const bool pressed = t.isPressed();
+
+  if (g_wifi_open) { down = adjusting = pending = false; return; }
+
+  if (pressed && !down) {                           // finger down
+    down = true; adjusting = false;
+    sx = lx = t.x; sy = ly = t.y;
+    t_down = now; bri0 = g_bri;
+  } else if (pressed) {                             // finger moving
+    lx = t.x; ly = t.y;
+    const int dx = lx - sx, dy = ly - sy;
+    if (!adjusting && g_disp_on && abs(dx) > 30 && abs(dx) > 2 * abs(dy)) adjusting = true;
+    if (adjusting) set_brightness(bri0 + dx * 255 / 800, true);  // ~800 px of travel = full range
+  } else if (down) {                                // finger up
+    down = false;
+    if (adjusting) {
+      adjusting = false;
+      prefs.putUChar("bri", g_bri);
+      g_bri_hide_at = now + 900;
+      Serial.printf("brightness %d (%d%%)\n", g_bri, (g_bri * 100 + 127) / 255);
+    } else if (abs(lx - sx) <= 40 && abs(ly - sy) <= 40 && now - t_down < 600 && now >= ignore_until) {
+      if (!g_disp_on) {                             // any tap wakes a sleeping display
+        display_set(true);
+        pending = false;
+        ignore_until = now + 600;                   // swallow the second tap of a wake double-tap
+      } else if (pending && now - pend_at <= DOUBLE_TAP_MS) {
+        pending = false;
+        display_set(false);
+        ignore_until = now + 500;
+      } else {
+        pending = true; px = lx; py = ly; pend_at = now;
+      }
+    }
+  }
+
+  if (pending && now - pend_at > DOUBLE_TAP_MS) {
+    pending = false;
+    run_tap(px, py);
   }
 }
 
@@ -1325,7 +1441,6 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Display.setRotation(ROTATION);
-  M5.Display.setBrightness(BRIGHTNESS);
   M5.Display.fillScreen(TFT_BLACK);
   Serial.printf("\nFancy clock: display %dx%d, PSRAM %u bytes free\n", (int)M5.Display.width(), (int)M5.Display.height(),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -1333,6 +1448,8 @@ void setup() {
   prefs.begin("clock", false);
   g_theme = prefs.getInt("theme", 0) % N_THEMES;
   g_24h = prefs.getBool("h24", true);
+  g_bri = (uint8_t)constrain((int)prefs.getUChar("bri", BRIGHTNESS), MIN_BRIGHTNESS, 255);
+  M5.Display.setBrightness(g_bri);
   if (M5.Rtc.isEnabled()) init_rtc_from_build(prefs);
   else Serial.println("WARNING: no RTC found");
 
@@ -1366,6 +1483,7 @@ void setup() {
 
   build_dynamic_ui();
   wifi_build();
+  bri_build();
   lv_indev_t* indev = lv_indev_create();
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(indev, touch_read_cb);
@@ -1387,6 +1505,7 @@ void loop() {
   handle_touch();       stat_add(st_tap, t); t = esp_timer_get_time();
   poll_rtc();           stat_add(st_rtc, t); t = esp_timer_get_time();
   handle_serial();      stat_add(st_ser, t); t = esp_timer_get_time();
+  bri_tick();
   net_apply();
   rtc_backup_write();
   {
