@@ -27,9 +27,10 @@ Board options are set in `tools/build.sh`. `ChipVariant=prev3` is for ESP32-P4 s
 ## Time
 Three sources, best first:
 1. **Network time (NTP)** - set up WiFi by tapping the WiFi icon in the top-right corner (scan, pick a network,
-   type the password). The clock then connects in the background (core 0), syncs over SNTP, and shuts the radio
-   down completely (the ESP-Hosted link to the C6 too, which also frees ~60 KB of internal RAM). It repeats every
-   6 hours; after a failed attempt it backs off (1, 2, 5, 10, 30, 60 min). The WiFi icon lights up while the
+   type the password). The clock then connects in the background (core 0), syncs over SNTP, and disconnects
+   (the WiFi stack stays initialised and the radio idles). It repeats every 6 hours; after a failed attempt it backs
+   off (1, 2, 5, 10, 30, 60 min). Switching WiFi fully off and on again between syncs was tried and is NOT reliable
+   on the Tab5 (every second re-init runs out of internal RAM and reboots) - see the comment in the code. The WiFi icon lights up while the
    time is NTP-synced. Daylight saving is automatic because the timezone is a POSIX TZ string.
 2. **RTC** - every NTP sync also writes the Tab5's RX8130 (on a whole-second boundary), so an offline reboot
    still starts within milliseconds. Without NTP for 24 h the clock falls back to the RTC.

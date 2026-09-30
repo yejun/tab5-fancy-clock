@@ -18,7 +18,6 @@
 #include <sys/time.h>
 #include <WiFi.h>
 #include <esp_sntp.h>
-#include "esp32-hal-hosted.h"
 #include "fonts.h"
 #include "types.h"
 
@@ -181,12 +180,17 @@ static void net_state(const char* fmt, ...) {
   Serial.printf("net: %s\n", g_net_state);
 }
 
-// Switch the radio off completely: drop the connection and shut down the ESP-Hosted link to the C6 chip,
-// which also gives its internal-RAM buffer pool back.  The next WiFi.mode() brings it up again.
+// Between syncs: disconnect but leave the WiFi stack (and the ESP-Hosted link to the C6) initialised.
+// A disconnected station idles the radio, so this costs very little.  Fully switching WiFi off and on again
+// looked like a better power saver but is NOT reliable on the Tab5 - all of these were tried:
+//  * WiFi.mode(WIFI_OFF) + WiFi.mode(WIFI_STA) on the next sync, with or without hostedDeinitWiFi(): every
+//    second re-init dies with "HS_MP: mempool create failed: no mem" (sdio_mempool_create assert -> reboot),
+//    because the ESP-Hosted SDIO buffer pool must be rebuilt in *internal* RAM, which the first session leaves
+//    fragmented.
+//  * cutting power to the C6 via WLAN_PWR_EN (IO expander 0x44 bit 0) saves ~6 mA of battery current, but needs
+//    the link torn down first, so it hits the same problem.
 static void net_radio_off() {
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  hostedDeinitWiFi();
+  WiFi.disconnect(false, false);
 }
 
 static constexpr int MAX_SCAN = 24;
