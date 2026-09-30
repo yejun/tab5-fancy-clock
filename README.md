@@ -9,7 +9,10 @@ Requires: Arduino CLI, the `m5stack:esp32` core (3.3.x), and the libraries `lvgl
 - Analog dial with sweeping second hand, day-progress ring, glass calendar card, big digital time, seconds bar, battery.
 - Touch controls (all remembered across reboots except display on/off):
   - **Drag left/right** anywhere → brightness (right = brighter). A small bar shows the level; minimum ~3% so the screen can't be lost.
-  - **Double-tap** → display off (backlight off, animation paused; the clock keeps time). While off, any tap wakes it.
+  - **Double-tap** → display off (backlight 0; all drawing and automatic WiFi syncs paused, only touch + serial stay
+    active; the clock keeps time). While off, any tap wakes it - the picture is refreshed *before* the backlight
+    comes on, so the second hand doesn't jump. (Panel sleep and CPU down-clocking were tried and don't work on the
+    Tab5: panel sleep also disables touch, and 40 MHz starves the MIPI-DSI controller. See comments in the code.)
   - **Tap the big digits** → 12h/24h. **Tap the WiFi icon** (top right) → WiFi setup. **Tap anywhere else** → next theme
     (Aurora, Sunset, Ocean, Graphite). Single taps act after a ~0.35 s pause so they can't be confused with a double-tap.
 - Static artwork is rendered once (32-bit, dithered to RGB565) into an image; only the hands/text are redrawn per frame.

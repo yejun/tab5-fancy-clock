@@ -152,6 +152,7 @@ static String g_tz = "PST8PDT,M3.2.0,M11.1.0";  // POSIX TZ string (US Pacific);
 static String g_ssid, g_pass;
 static char g_net_state[64] = "no wifi configured";
 static volatile int  g_net_cmd = 0;          // 1 = sync now, 2 = scan (consumed by the network task)
+static volatile bool g_disp_on = true;       // display state; while it is off, no automatic WiFi syncs are started
 static volatile bool g_sntp_done = false;
 static volatile bool g_ntp_ready = false;    // task -> loop hand-over
 static volatile int64_t g_ntp_utc_ms = 0, g_ntp_mono_ms = 0;
@@ -270,7 +271,7 @@ static void net_task(void*) {
     vTaskDelay(pdMS_TO_TICKS(200));
     const int cmd = g_net_cmd;
     if (cmd == 2) { g_net_cmd = 0; net_scan(); continue; }
-    if (cmd == 1 || (!g_ssid.isEmpty() && mono_ms() >= next)) {
+    if (cmd == 1 || (g_disp_on && !g_ssid.isEmpty() && mono_ms() >= next)) {  // a due sync runs as soon as the display wakes
       g_net_cmd = 0;
       if (net_sync()) { fails = 0; next = mono_ms() + NTP_RESYNC_MS; }
       else { next = mono_ms() + BACKOFF_MS[fails < 5 ? fails : 5]; fails++; }
@@ -1167,7 +1168,6 @@ static void wifi_build() {
 // ----------------------------------------------------------------------------------------------
 static constexpr int MIN_BRIGHTNESS = 8;   // never fully black by swiping, so the screen can't be "lost"
 static uint8_t g_bri = BRIGHTNESS;
-static bool    g_disp_on = true;
 static int64_t g_bri_hide_at = 0;
 static lv_obj_t *bri_ui, *bri_lbl, *bri_bar;
 
@@ -1217,17 +1217,30 @@ static void bri_tick() {
   }
 }
 
-// "Off" = backlight 0 and no animation work; the clock keeps its time in the background.
+// "Off" = the lowest-power state that still keeps touch, serial and the clock's time alive:
+//   backlight 0, no LVGL work, no automatic WiFi syncs, and loop() polls touch at ~30 Hz (see loop()).
+//   The RTC/NTP-derived time keeps running on the crystal timer.
+// NOTE 1: the panel must NOT be put into DSI sleep (M5.Display.sleep()): the Tab5's touch controller lives in
+//   the same chip as the display driver and stops reporting touches, so nothing could wake it again.
+// NOTE 2: lowering the CPU clock is NOT possible - the P4 only offers 360 or 40 MHz, and at 40 MHz the
+//   MIPI-DSI controller (which keeps streaming from PSRAM) underruns and the chip resets.
 static void display_set(bool on) {
   if (on == g_disp_on) return;
   g_disp_on = on;
   if (on) {
-    M5.Display.setBrightness(g_bri);
+    // Bring the picture up to date *before* the backlight comes on, so the second hand (and time, battery,
+    // ...) don't visibly jump from their stale positions.
     lv_timer_resume(g_fast_timer);
     g_dirty_all = true;
+    update_battery();
+    lv_obj_invalidate(lv_screen_active());
+    lv_timer_ready(g_fast_timer);   // run the clock update on the next handler pass
+    lv_timer_handler();
+    lv_refr_now(g_disp);            // render + flush everything now
+    M5.Display.setBrightness(g_bri);
   } else {
-    M5.Display.setBrightness(0);
     lv_timer_pause(g_fast_timer);
+    M5.Display.setBrightness(0);
   }
   Serial.printf("display %s\n", on ? "on" : "off");
 }
@@ -1439,6 +1452,10 @@ void setup() {
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);  // never block the UI when nobody is reading the USB port
   auto cfg = M5.config();
+  cfg.output_power = false;   // don't power the 5 V external/USB-host outputs - nothing is plugged in there
+  cfg.internal_imu = false;   // the clock uses none of: IMU, microphone, speaker/audio codec
+  cfg.internal_mic = false;
+  cfg.internal_spk = false;
   M5.begin(cfg);
   M5.Display.setRotation(ROTATION);
   M5.Display.fillScreen(TFT_BLACK);
@@ -1500,6 +1517,14 @@ void setup() {
 }
 
 void loop() {
+  if (!g_disp_on) {          // display off: only touch (to wake) and serial; nothing else runs
+    M5.update();
+    handle_touch();
+    handle_serial();
+    net_apply();             // adopts the result of a manually requested sync, if any
+    delay(30);
+    return;
+  }
   int64_t t = esp_timer_get_time();
   M5.update();          stat_add(st_upd, t); t = esp_timer_get_time();
   handle_touch();       stat_add(st_tap, t); t = esp_timer_get_time();
