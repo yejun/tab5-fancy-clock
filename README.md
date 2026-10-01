@@ -17,8 +17,15 @@ Requires: Arduino CLI, the `m5stack:esp32` core (3.3.x), and the libraries `lvgl
     active; the clock keeps time). While off, any tap wakes it - the picture is refreshed *before* the backlight
     comes on, so the second hand doesn't jump. (Panel sleep and CPU down-clocking were tried and don't work on the
     Tab5: panel sleep also disables touch, and 40 MHz starves the MIPI-DSI controller. See comments in the code.)
-  - **Tap the big digits** → 12h/24h. **Tap the WiFi icon** (top right) → WiFi setup. **Tap anywhere else** → next theme
+  - **Tap the big digits** → 12h/24h. **Tap the WiFi icon** (top right) → WiFi setup. **Tap the battery icon** →
+    a card with level, charging state, voltage (pack and per cell), current, power and a rough time-left /
+    time-to-full estimate (2000 mAh pack, smoothed current); refreshed every second, the next tap anywhere closes it. **Tap anywhere else** → next theme
     (Aurora, Sunset, Ocean, Jade, Graphite). Single taps act after a ~0.35 s pause so they can't be confused with a double-tap.
+
+- **Auto-rotate**: turn the Tab5 upside-down and the picture follows (landscape and landscape upside-down only).
+  The new orientation has to be held for 1.2 s, and lying flat, standing on a short side, being moved or a finger on
+  the glass never turns it. Only the accelerometer runs (the gyro is switched off); it is read 5x a second while the
+  display is on. A turn is one full redraw - LVGL keeps drawing in landscape, only the PPA flush rotates differently.
 
 ## Rendering / power
 With the display on, the CPU is busy ~20% of the time (it was ~80% at 27 fps before this pipeline):
@@ -65,12 +72,14 @@ POSIX TZ examples: `EST5EDT,M3.2.0,M11.1.0` (US Eastern), `GMT0BST,M3.5.0/1,M10.
 ## Other helpers
     tools/clockctl.py shot out.png   # screenshot over USB serial (out_fb.png: read back from the panel frame buffer)
     tools/clockctl.py cmd S|C|M      # status+timing stats / next theme / toggle 12-24h
+    tools/clockctl.py cmd A          # accelerometer reading and the orientation it asks for
+    tools/clockctl.py cmd G          # open/close the battery card
     tools/clockctl.py cmd K          # stress test: 20 automatic theme switches
     tools/clockctl.py cmd H<mask>    # debug: 1=hide day ring 2=hand shadows 4=soft shadow penumbra
     tools/clockctl.py log 5          # device log
     tools/make_fonts.sh              # regenerate fonts.h (Noto Sans subset, OFL)
 
-`ROTATION` (1 or 3), `BRIGHTNESS`, `FRAME_MS` (animation period) and `TOUCH_MS` are constants at the top of
+`ROTATION` (start-up orientation when the IMU can't tell, 1 or 3), `ROT_HOLD_MS`, `BRIGHTNESS`, `FRAME_MS` (animation period) and `TOUCH_MS` are constants at the top of
 `fancy_clock.ino`. Themes are the `THEMES` table next to them.
 
 ## Credits

@@ -32,7 +32,8 @@
 // ----------------------------------------------------------------------------------------------
 // Configuration
 // ----------------------------------------------------------------------------------------------
-static constexpr int      ROTATION   = 1;    // 1 = landscape, 3 = landscape upside-down
+static constexpr int      ROTATION   = 1;    // start-up orientation if the IMU can't tell: 1 = landscape, 3 = upside-down
+static constexpr int      ROT_HOLD_MS = 1200; // auto-rotate: a new orientation must be held this long before the screen turns
 static constexpr uint8_t  BRIGHTNESS = 200;  // 0..255
 static constexpr int      FRAME_MS   = 66;   // clock animation period (~15 fps)
 static constexpr int      TOUCH_MS   = 25;   // touch polling period while the display is on
@@ -395,6 +396,7 @@ static int64_t  g_busy_us = 0, g_stat_t0 = 0;   // time loop() spent working (no
 static constexpr int FB_W = 720, FB_H = 1280;
 static ppa_client_handle_t g_ppa = nullptr;
 static uint16_t* g_fb = nullptr;
+static int g_rot = ROTATION;   // current display rotation (1 or 3), changed by auto-rotation
 
 static void ppa_setup() {
   auto* panel = static_cast<lgfx::Panel_DSI*>(M5.Display.getPanel());
@@ -416,7 +418,7 @@ static bool ppa_flush(const lv_area_t* a, const uint8_t* px, int w, int h) {
   op.out.pic_w = FB_W;
   op.out.pic_h = FB_H;
   op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-  if (ROTATION == 1) {        // logical (x, y) -> panel (719 - y, x): 90 deg clockwise = 270 counter-clockwise
+  if (g_rot == 1) {           // logical (x, y) -> panel (719 - y, x): 90 deg clockwise = 270 counter-clockwise
     op.rotation_angle = PPA_SRM_ROTATION_ANGLE_270;
     op.out.block_offset_x = FB_W - 1 - a->y2;
     op.out.block_offset_y = a->x1;
@@ -1730,6 +1732,156 @@ static void wifi_build() {
 }
 
 // ----------------------------------------------------------------------------------------------
+// Battery details: tap the battery icon (top right) for a small card with the gauge readings; the next tap closes it.
+// It sits clear of everything that is redrawn per frame, so while it is open it only costs its own 1 s refresh.
+// ----------------------------------------------------------------------------------------------
+static constexpr int BATT_MAH = 2000;          // the Tab5's NP-F550-type pack (2 cells in series), for the time estimate
+static constexpr int BC_W = 380, BC_H = 236, BC_X = PX + PW - BC_W, BC_Y = 74;
+static lv_obj_t *batt_ui, *batt_pct, *batt_state, *batt_bar, *batt_keys, *batt_vals;
+static lv_timer_t* g_batt_timer = nullptr;
+static bool  g_batt_open = false;
+static float g_batt_ma = NAN;                  // smoothed current (+ = charging), for the time estimate
+
+static void batt_refresh(lv_timer_t*) {
+  const Theme& th = THEMES[g_theme];
+  const int mv = M5.Power.getBatteryVoltage(), lvl = M5.Power.getBatteryLevel();
+  const float ma = M5.Power.getBatteryCurrent();
+  const bool chg = M5.Power.isCharging() == m5::Power_Class::is_charging;
+  char b[128];
+  if (mv < 5500 || lvl < 0) {                  // no pack fitted (see update_battery)
+    lv_label_set_text(batt_pct, "--");
+    lv_label_set_text(batt_state, "No battery");
+    lv_bar_set_value(batt_bar, 0, LV_ANIM_OFF);
+    lv_label_set_text(batt_vals, "-\n-\n-\n-");
+    return;
+  }
+  g_batt_ma = isnan(g_batt_ma) ? ma : g_batt_ma + (ma - g_batt_ma) * 0.2f;   // the reading jumps with the CPU load
+
+  snprintf(b, sizeof(b), "%d%%", lvl);
+  lv_label_set_text(batt_pct, b);
+  const char* st = chg ? "Charging" : g_batt_ma > -30 ? (lvl >= 95 ? "Full" : "Not charging") : "On battery";
+  lv_label_set_text(batt_state, st);
+  lv_obj_set_style_text_color(batt_state, lv_color_hex(chg ? th.acc1 : th.ink), 0);
+  lv_bar_set_value(batt_bar, lvl, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(batt_bar, lv_color_hex(lvl <= 15 && !chg ? th.acc2 : th.acc1), LV_PART_INDICATOR);
+
+  // Rough time estimate from the level and the smoothed current (charging tapers off near full, so it is optimistic)
+  float hours = -1;
+  if (chg && g_batt_ma > 50) hours = (100 - lvl) / 100.0f * BATT_MAH / g_batt_ma;
+  else if (!chg && g_batt_ma < -30) hours = lvl / 100.0f * BATT_MAH / -g_batt_ma;
+  char est[32] = "-";
+  if (hours >= 0) {
+    const int m = (int)(hours * 60 + 0.5f);
+    snprintf(est, sizeof(est), "~%d h %02d min", m / 60, m % 60);
+  }
+  lv_label_set_text(batt_keys, chg ? "Voltage\nCurrent\nPower\nFull in" : "Voltage\nCurrent\nPower\nTime left");
+  snprintf(b, sizeof(b), "%.2f V  (%.2f V/cell)\n%+d mA\n%.2f W\n%s", mv / 1000.0f, mv / 2000.0f, (int)lroundf(ma),
+           fabsf(mv * ma) / 1e6f, est);
+  lv_label_set_text(batt_vals, b);
+}
+
+static void batt_build() {
+  batt_ui = mk(lv_layer_top(), BC_X, BC_Y, BC_W, BC_H);
+  lv_obj_set_style_radius(batt_ui, 24, 0);
+  lv_obj_set_style_bg_opa(batt_ui, 250, 0);   // nearly opaque: the big digits would ghost through
+  lv_obj_set_style_border_width(batt_ui, 1, 0);
+  lv_obj_set_style_border_opa(batt_ui, 50, 0);
+  lv_obj_add_flag(batt_ui, LV_OBJ_FLAG_HIDDEN);
+  batt_pct = mk_label(batt_ui, f_date, 0xFFFFFF, LV_OPA_COVER, "", 24, 14, 140);
+  batt_state = mk_label(batt_ui, f_small, 0xFFFFFF, LV_OPA_COVER, "", 150, 28, BC_W - 174, LV_TEXT_ALIGN_RIGHT);
+  batt_bar = lv_bar_create(batt_ui);
+  lv_obj_remove_style_all(batt_bar);
+  lv_obj_set_pos(batt_bar, 24, 74);
+  lv_obj_set_size(batt_bar, BC_W - 48, 8);
+  lv_bar_set_range(batt_bar, 0, 100);
+  lv_obj_set_style_radius(batt_bar, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(batt_bar, 40, LV_PART_MAIN);
+  lv_obj_set_style_radius(batt_bar, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(batt_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+  batt_keys = mk_label(batt_ui, f_small, 0xFFFFFF, 150, "", 24, 96, 140);
+  batt_vals = mk_label(batt_ui, f_small, 0xFFFFFF, 235, "", 120, 96, BC_W - 144, LV_TEXT_ALIGN_RIGHT);
+  g_batt_timer = lv_timer_create(batt_refresh, 1000, nullptr);
+  lv_timer_pause(g_batt_timer);
+}
+
+static void batt_open() {
+  if (g_batt_open) return;
+  g_batt_open = true;
+  const Theme& th = THEMES[g_theme];
+  lv_obj_set_style_bg_color(batt_ui, lv_color_hex(th.bg_top), 0);
+  lv_obj_set_style_border_color(batt_ui, lv_color_hex(th.ink), 0);
+  for (lv_obj_t* l : {batt_pct, batt_keys, batt_vals}) lv_obj_set_style_text_color(l, lv_color_hex(th.ink), 0);
+  lv_obj_set_style_bg_color(batt_bar, lv_color_hex(th.ink), LV_PART_MAIN);
+  g_batt_ma = NAN;
+  batt_refresh(nullptr);
+  lv_obj_remove_flag(batt_ui, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(batt_ui);
+  lv_timer_resume(g_batt_timer);
+}
+
+static void batt_close() {
+  if (!g_batt_open) return;
+  g_batt_open = false;
+  lv_obj_add_flag(batt_ui, LV_OBJ_FLAG_HIDDEN);
+  lv_timer_pause(g_batt_timer);
+}
+
+// ----------------------------------------------------------------------------------------------
+// Auto-rotation between landscape and landscape upside-down, from the accelerometer.  Lying flat, standing on a
+// short side or being moved around never turns the screen, and a new orientation has to be held for ROT_HOLD_MS.
+// Touch coordinates follow M5.Display's rotation; LVGL keeps drawing in landscape and only the PPA flush (and the
+// frame-buffer screenshot) map to the panel differently, so a turn is just one full redraw.
+// ----------------------------------------------------------------------------------------------
+static constexpr int   ORIENT_POLL_MS = 200;
+static constexpr int   ORIENT_AXIS = 0;        // accelerometer axis along the screen's short side
+static constexpr float ORIENT_SIGN = -1;       // gravity along +axis (times this) means rotation 1 is upright
+                                               // (on the device: upright in rotation 1 reads x = -1.0 g)
+static constexpr float ORIENT_MIN_G = 0.5f;    // in-plane gravity needed, in g (~30 degrees of tilt from flat)
+static bool g_imu_ok = false;
+
+static void imu_setup() {
+  g_imu_ok = M5.Imu.isEnabled();
+  if (!g_imu_ok) { Serial.println("WARNING: no IMU, auto-rotation off"); return; }
+  // Only the accelerometer is needed; M5Unified switches the gyro (~0.9 mA) on too, so turn it off again.
+  for (uint8_t a : {0x68, 0x69})
+    if (M5.In_I2C.readRegister8(a, 0x00, 400000) == 0x24)   // BMI270 CHIP_ID
+      M5.In_I2C.writeRegister8(a, 0x7D, 0x04, 400000);       // PWR_CTRL: accelerometer only
+}
+
+// The rotation the accelerometer asks for: 1 or 3, or 0 if undecided.
+static int orient_sample() {
+  if (!g_imu_ok) return 0;
+  float a[3];
+  M5.Imu.getAccel(&a[0], &a[1], &a[2]);
+  const float g = ORIENT_SIGN * a[ORIENT_AXIS], side = fabsf(a[1 - ORIENT_AXIS]);
+  const float mag2 = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
+  if (mag2 < 0.7f * 0.7f || mag2 > 1.3f * 1.3f) return 0;   // being moved
+  if (fabsf(g) < ORIENT_MIN_G || fabsf(g) < 1.5f * side) return 0;
+  return g > 0 ? 1 : 3;
+}
+
+static void set_rotation(int r) {
+  if (r == g_rot) return;
+  g_rot = r;
+  M5.Display.setRotation(r);
+  lv_obj_invalidate(lv_screen_active());   // the whole screen, all layers
+  Serial.printf("rotation %d\n", r);
+}
+
+// Called every loop pass while the display is on; `now` (display wake-up) turns at once if the answer is clear.
+static void orient_tick(bool now) {
+  static int64_t next = 0, cand_since = 0;
+  static int cand = 0;
+  const int64_t t = mono_ms();
+  if (!g_imu_ok || (!now && t < next)) return;
+  next = t + ORIENT_POLL_MS;
+  const int r = orient_sample();
+  if (r == 0 || r == g_rot) { cand = 0; return; }
+  if (r != cand) { cand = r; cand_since = t; }
+  if ((now || t - cand_since >= ROT_HOLD_MS) && !M5.Touch.getCount()) { cand = 0; set_rotation(r); }
+}
+
+// ----------------------------------------------------------------------------------------------
 // Display power & brightness: swipe left/right to dim/brighten, double-tap to turn the display off/on.
 // ----------------------------------------------------------------------------------------------
 static constexpr int MIN_BRIGHTNESS = 8;   // never fully black by swiping, so the screen can't be "lost"
@@ -1798,6 +1950,7 @@ static void display_set(bool on) {
     // ...) don't visibly jump from their stale positions.
     lv_timer_resume(g_fast_timer);
     g_dirty_all = true;
+    orient_tick(true);              // it may have been turned round while dark
     update_battery();
     lv_obj_invalidate(lv_screen_active());
     lv_timer_ready(g_fast_timer);   // run the clock update on the next handler pass
@@ -1805,6 +1958,7 @@ static void display_set(bool on) {
     lv_refr_now(g_disp);            // render + flush everything now
     M5.Display.setBrightness(g_bri);
   } else {
+    batt_close();
     lv_timer_pause(g_fast_timer);
     M5.Display.setBrightness(0);
   }
@@ -1842,7 +1996,7 @@ static void send_fb_screenshot() {
   static uint16_t row[SCR_W];
   for (int y = 0; y < SCR_H; y++) {
     for (int x = 0; x < SCR_W; x++)
-      row[x] = ROTATION == 1 ? g_fb[x * FB_W + (FB_W - 1 - y)] : g_fb[(FB_H - 1 - x) * FB_W + y];
+      row[x] = g_rot == 1 ? g_fb[x * FB_W + (FB_W - 1 - y)] : g_fb[(FB_H - 1 - x) * FB_W + y];
     size_t off = 0;
     const uint8_t* p = (const uint8_t*)row;
     while (off < sizeof(row)) {
@@ -1960,6 +2114,13 @@ static void handle_serial() {
         break;
       }
       case 'F': send_fb_screenshot(); break;
+      case 'A': {  // accelerometer + orientation (for checking ORIENT_AXIS / ORIENT_SIGN)
+        float x = 0, y = 0, z = 0;
+        if (g_imu_ok) M5.Imu.getAccel(&x, &y, &z);
+        Serial.printf("OK accel x=%.2f y=%.2f z=%.2f g | wants rotation %d, showing %d\n", x, y, z, orient_sample(), g_rot);
+        break;
+      }
+      case 'G': if (g_batt_open) batt_close(); else batt_open(); Serial.printf("OK battery card %s\n", g_batt_open ? "open" : "closed"); break;
       default: Serial.println("ERR unknown command"); break;
     }
   }
@@ -1977,7 +2138,11 @@ static void touch_read_cb(lv_indev_t*, lv_indev_data_t* d) {
 
 // A confirmed single tap on the clock face.
 static void run_tap(int x, int y) {
-  if (x >= PX + PW - 260 && y < 90) {               // top-right corner (WiFi icon / battery)
+  if (g_batt_open) {                                // any tap closes the battery card
+    batt_close();
+  } else if (x >= PX + PW - 128 && y < 90) {        // battery icon (top right)
+    batt_open();
+  } else if (x >= PX + PW - 260 && y < 90) {        // WiFi icon, left of it
     wifi_open();
   } else if (x >= PX && y < 250) {                  // the big digits
     g_24h = !g_24h;
@@ -2047,11 +2212,13 @@ void setup() {
   Serial.setTxTimeoutMs(0);  // never block the UI when nobody is reading the USB port
   auto cfg = M5.config();
   cfg.output_power = false;   // don't power the 5 V external/USB-host outputs - nothing is plugged in there
-  cfg.internal_imu = false;   // the clock uses none of: IMU, microphone, speaker/audio codec
-  cfg.internal_mic = false;
+  cfg.internal_imu = true;    // accelerometer for auto-rotation (the gyro is switched off again in imu_setup)
+  cfg.internal_mic = false;   // the clock uses neither the microphone nor the speaker/audio codec
   cfg.internal_spk = false;
   M5.begin(cfg);
-  M5.Display.setRotation(ROTATION);
+  imu_setup();
+  { const int r = orient_sample(); g_rot = r ? r : ROTATION; }   // start the right way up
+  M5.Display.setRotation(g_rot);
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.display();
   ppa_setup();
@@ -2098,6 +2265,7 @@ void setup() {
   build_dynamic_ui();
   wifi_build();
   bri_build();
+  batt_build();
   g_indev = lv_indev_create();
   lv_indev_set_type(g_indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(g_indev, touch_read_cb);
@@ -2130,6 +2298,7 @@ void loop() {
   const bool rtc_busy = poll_rtc(); stat_add(st_rtc, t); t = esp_timer_get_time();
   handle_serial();      stat_add(st_ser, t); t = esp_timer_get_time();
   bri_tick();
+  orient_tick(false);
   net_apply();
   rtc_backup_write();
   {
