@@ -1,0 +1,5 @@
+# Host tools: tools/clockctl.py, tools/device_test.py
+pyserial>=3.5
+# Only for saving PNG screenshots (clockctl.py shot)
+numpy
+Pillow

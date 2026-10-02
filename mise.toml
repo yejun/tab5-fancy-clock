@@ -1,0 +1,24 @@
+# Entering this directory activates .venv (created on first use).
+# One-time setup:  mise trust && mise run setup
+[tools]
+python = "3"
+
+[env]
+_.python.venv = { path = ".venv", create = true, uv_create_args = ["--seed"] }
+CLOCK_PORT = "/dev/ttyACM0"
+
+[tasks.setup]
+description = "Install the Python packages for the host tools"
+run = "python -m pip install -q -r requirements.txt"
+
+[tasks.test]
+description = "Host tests (no hardware)"
+run = "tools/test.sh"
+
+[tasks.flash]
+description = "Build and flash the connected Tab5"
+run = "tools/build.sh upload $CLOCK_PORT"
+
+[tasks.device-test]
+description = "Device integration tests (~3 minutes)"
+run = "python tools/device_test.py --port $CLOCK_PORT"

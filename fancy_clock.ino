@@ -26,6 +26,9 @@
 #include <sys/time.h>
 #include <WiFi.h>
 #include <esp_sntp.h>
+#include <atomic>
+#include <freertos/queue.h>
+#include <esp_log.h>
 #include "fonts.h"
 #include "types.h"
 
@@ -62,326 +65,10 @@ static const char* const WEEKDAYS[] = {"Sunday", "Monday", "Tuesday", "Wednesday
 // ----------------------------------------------------------------------------------------------
 // Calendar maths (proleptic Gregorian, days since 1970-01-01)
 // ----------------------------------------------------------------------------------------------
-static int64_t days_from_civil(int y, int m, int d) {
-  y -= m <= 2;
-  const int64_t era = (y >= 0 ? y : y - 399) / 400;
-  const unsigned yoe = (unsigned)(y - era * 400);
-  const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
-  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + (int64_t)doe - 719468;
-}
-
-static void civil_from_days(int64_t z, int& y, int& m, int& d) {
-  z += 719468;
-  const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-  const unsigned doe = (unsigned)(z - era * 146097);
-  const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-  const unsigned mp = (5 * doy + 2) / 153;
-  d = doy - (153 * mp + 2) / 5 + 1;
-  m = mp < 10 ? mp + 3 : mp - 9;
-  y = (int)(yoe + era * 400) + (m <= 2);
-}
-
-static int days_in_month(int y, int m) {
-  static const uint8_t dm[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-  if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
-  return dm[m - 1];
-}
-
-static int weekday_of(int y, int m, int d) {  // 0 = Sunday
-  int64_t z = days_from_civil(y, m, d);
-  return (int)(((z % 7) + 11) % 7);  // 1970-01-01 was a Thursday (4)
-}
-
-// ----------------------------------------------------------------------------------------------
-// Time keeping: the RTC only has 1 s resolution, so we phase-lock a millisecond clock to its ticks.
-// ----------------------------------------------------------------------------------------------
-static int64_t g_base_ms = 0;      // local-time epoch ms at mono_ms() == 0
-static bool    g_synced  = false;
-static bool    g_resync  = true;   // request a phase-lock to the RTC's next second boundary
-static int     g_corr_n = 0, g_corr_max_ms = 0, g_reject_n = 0;
-
-static inline int64_t mono_ms() { return esp_timer_get_time() / 1000; }
-
-static int64_t rtc_epoch_s(const m5::rtc_datetime_t& dt) {
-  return days_from_civil(dt.date.year, dt.date.month, dt.date.date) * 86400LL +
-         dt.time.hours * 3600 + dt.time.minutes * 60 + dt.time.seconds;
-}
-
-static bool ntp_active();
-
-// The RTC only has 1 s resolution. To phase-lock our ms clock to it we poll quickly until the seconds
-// field changes.  A boundary is only trusted if the two polls around it were close together, so a
-// stalled loop can never move the clock.  After a lock we leave the RTC alone for 10 minutes.
-static bool poll_rtc() {   // returns true while phase-locking (wants a 4 ms poll)
-  static bool syncing = false, have_prev = false;
-  static int64_t last_poll = 0, prev_done = 0, next_sync = 0, sync_start = 0;
-  static int prev_sec = -1;
-  const int64_t t0 = mono_ms();
-  if (ntp_active()) return false;                  // NTP is the master clock
-
-  if (!syncing) {
-    if (!g_resync && t0 < next_sync) return false;
-    syncing = true; have_prev = false; g_resync = false; sync_start = t0;
-  }
-  if (t0 - last_poll < 4) return true;
-  last_poll = t0;
-
-  m5::rtc_datetime_t dt;
-  if (!M5.Rtc.getDateTime(&dt)) return true;
-  const int64_t t1 = mono_ms();
-  const int64_t sec = rtc_epoch_s(dt);
-  const int64_t read_at = (t0 + t1) / 2;
-
-  if (!g_synced && !have_prev) g_base_ms = sec * 1000 + 500 - t1;  // provisional, until we see a boundary
-
-  if (have_prev && dt.time.seconds != prev_sec) {
-    if (read_at - prev_done <= 15) {  // tight window -> boundary is known to within ~8 ms
-      const int64_t cand = sec * 1000 - (prev_done + read_at) / 2;
-      const int d = (int)(cand - g_base_ms);
-      if (g_synced) { g_corr_n++; if (abs(d) > g_corr_max_ms) g_corr_max_ms = abs(d); }
-      g_base_ms = cand;
-      g_synced = true;
-      syncing = false;
-      next_sync = t1 + 10 * 60 * 1000;
-      return false;
-    }
-    g_reject_n++;  // a poll was delayed; wait for the next boundary
-  }
-  have_prev = true;
-  prev_sec = dt.time.seconds;
-  prev_done = t1;
-  if (t1 - sync_start > 4000) { syncing = false; next_sync = t1 + 5000; }  // give up for now
-  return syncing;
-}
-
-// ----------------------------------------------------------------------------------------------
-// Network time (WiFi + SNTP).  A background task on core 0 connects, syncs, and disconnects again;
-// the UI thread only ever sees a (utc_ms, mono_ms) pair handed over through a flag.
-// ----------------------------------------------------------------------------------------------
-static constexpr int64_t NTP_RESYNC_MS = 6LL * 60 * 60 * 1000;   // re-sync every 6 hours (WiFi is off in between)
-static constexpr int64_t NTP_VALID_MS  = 24LL * 60 * 60 * 1000;  // fall back to the RTC if no sync for 24 h
-
-static String g_tz = "PST8PDT,M3.2.0,M11.1.0";  // POSIX TZ string (US Pacific); change with the Z command
-static String g_ssid, g_pass;
-static char g_net_state[64] = "no wifi configured";
-static volatile int  g_net_cmd = 0;          // 1 = sync now, 2 = scan (consumed by the network task)
-static volatile bool g_disp_on = true;       // display state; while it is off, no automatic WiFi syncs are started
-static volatile bool g_sntp_done = false;
-static volatile bool g_ntp_ready = false;    // task -> loop hand-over
-static volatile int64_t g_ntp_utc_ms = 0, g_ntp_mono_ms = 0;
-static bool    g_ntp_valid = false;
-static int64_t g_utc_base_ms = 0;            // UTC epoch ms at mono_ms() == 0
-static int64_t g_ntp_last_mono = 0;
-static int64_t g_rtc_write_utc_s = 0;        // whole UTC second at which to write the RTC (0 = none)
-static int     g_ntp_count = 0;
-
-static bool ntp_active() {
-  static bool was = false;
-  const bool now = g_ntp_valid && (mono_ms() - g_ntp_last_mono) < NTP_VALID_MS;
-  if (was && !now) g_resync = true;          // NTP went stale: re-lock to the RTC
-  was = now;
-  return now;
-}
-
-static void sntp_cb(struct timeval*) { g_sntp_done = true; }
-
-static void net_state(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-static void net_state(const char* fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(g_net_state, sizeof(g_net_state), fmt, ap);
-  va_end(ap);
-  Serial.printf("net: %s\n", g_net_state);
-}
-
-// Between syncs: disconnect but leave the WiFi stack (and the ESP-Hosted link to the C6) initialised.
-// A disconnected station idles the radio, so this costs very little.  Fully switching WiFi off and on again
-// looked like a better power saver but is NOT reliable on the Tab5 - all of these were tried:
-//  * WiFi.mode(WIFI_OFF) + WiFi.mode(WIFI_STA) on the next sync, with or without hostedDeinitWiFi(): every
-//    second re-init dies with "HS_MP: mempool create failed: no mem" (sdio_mempool_create assert -> reboot),
-//    because the ESP-Hosted SDIO buffer pool must be rebuilt in *internal* RAM, which the first session leaves
-//    fragmented.
-//  * cutting power to the C6 via WLAN_PWR_EN (IO expander 0x44 bit 0) saves ~6 mA of battery current, but needs
-//    the link torn down first, so it hits the same problem.
-static void net_radio_off() {
-  WiFi.disconnect(false, false);
-}
-
-static constexpr int MAX_SCAN = 24;
-static ScanEntry g_scan[MAX_SCAN];           // filled by the network task, read by the UI after g_scan_ready
-static volatile int  g_scan_n = 0;
-static volatile bool g_scan_ready = false;
-
-static void net_scan() {
-  net_state("scanning...");
-  WiFi.mode(WIFI_STA);
-  const int n = WiFi.scanNetworks();
-  int cnt = 0;
-  static ScanEntry tmp[MAX_SCAN];
-  for (int i = 0; i < n; i++) {         // de-duplicate by SSID (keep the strongest), skip hidden networks
-    const String ss = WiFi.SSID(i);
-    if (ss.isEmpty()) continue;
-    int j = 0;
-    while (j < cnt && strcmp(tmp[j].ssid, ss.c_str()) != 0) j++;
-    const int8_t rssi = (int8_t)WiFi.RSSI(i);
-    if (j == cnt) {
-      if (cnt >= MAX_SCAN) continue;
-      strlcpy(tmp[cnt].ssid, ss.c_str(), sizeof(tmp[cnt].ssid));
-      tmp[cnt].rssi = rssi;
-      tmp[cnt].secure = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
-      cnt++;
-    } else if (rssi > tmp[j].rssi) {
-      tmp[j].rssi = rssi;
-    }
-  }
-  for (int a = 1; a < cnt; a++)         // strongest first
-    for (int b = a; b > 0 && tmp[b].rssi > tmp[b - 1].rssi; b--) { ScanEntry x = tmp[b]; tmp[b] = tmp[b - 1]; tmp[b - 1] = x; }
-  memcpy(g_scan, tmp, sizeof(ScanEntry) * cnt);
-  g_scan_n = cnt;
-  for (int i = 0; i < cnt; i++) Serial.printf("  %-32s %ddBm %s\n", g_scan[i].ssid, (int)g_scan[i].rssi, g_scan[i].secure ? "secured" : "open");
-  WiFi.scanDelete();
-  net_radio_off();
-  g_scan_ready = true;
-  net_state("scan done: %d networks", cnt);
-}
-
-// Returns true on success and hands the time to the UI thread.
-static bool net_sync() {
-  if (g_ssid.isEmpty()) { net_state("no wifi configured"); return false; }
-  net_state("connecting to %s", g_ssid.c_str());
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(g_ssid.c_str(), g_pass.c_str());
-  for (int i = 0; i < 100 && WiFi.status() != WL_CONNECTED; i++) vTaskDelay(pdMS_TO_TICKS(200));
-  if (WiFi.status() != WL_CONNECTED) {
-    net_state("wifi connect failed (status %d)", (int)WiFi.status());
-    net_radio_off();
-    return false;
-  }
-  net_state("connected %s rssi %d, syncing time", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
-
-  g_sntp_done = false;
-  sntp_set_time_sync_notification_cb(sntp_cb);
-  configTzTime(g_tz.c_str(), "time.cloudflare.com", "pool.ntp.org", "time.google.com");
-  for (int i = 0; i < 150 && !g_sntp_done; i++) vTaskDelay(pdMS_TO_TICKS(100));
-
-  bool ok = false;
-  if (g_sntp_done) {
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    g_ntp_mono_ms = mono_ms();
-    g_ntp_utc_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-    g_ntp_ready = true;
-    ok = true;
-    net_state("time synced");
-  } else {
-    net_state("NTP timeout");
-  }
-  net_radio_off();
-  return ok;
-}
-
-static void net_task(void*) {
-  int64_t next = 0;   // mono time of the next automatic attempt
-  int fails = 0;
-  // After a failure (wrong password, network away) back off so we don't burn battery retrying.
-  static const int64_t BACKOFF_MS[] = {60000, 120000, 300000, 600000, 1800000, 3600000};
-  for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(200));
-    const int cmd = g_net_cmd;
-    if (cmd == 2) { g_net_cmd = 0; net_scan(); continue; }
-    if (cmd == 1 || (g_disp_on && !g_ssid.isEmpty() && mono_ms() >= next)) {  // a due sync runs as soon as the display wakes
-      g_net_cmd = 0;
-      if (net_sync()) { fails = 0; next = mono_ms() + NTP_RESYNC_MS; }
-      else { next = mono_ms() + BACKOFF_MS[fails < 5 ? fails : 5]; fails++; }
-    }
-  }
-}
-
-// Loop-thread side: adopt a new NTP fix and schedule the RTC backup write for a whole-second boundary.
-static void net_apply() {
-  if (!g_ntp_ready) return;
-  g_ntp_ready = false;
-  const int64_t old_base = g_utc_base_ms;
-  const bool had = g_ntp_valid;
-  g_utc_base_ms = g_ntp_utc_ms - g_ntp_mono_ms;
-  g_ntp_valid = true;
-  g_ntp_last_mono = mono_ms();
-  g_ntp_count++;
-  g_rtc_write_utc_s = (g_utc_base_ms + mono_ms()) / 1000 + 2;
-  if (had) Serial.printf("ntp: clock corrected by %d ms\n", (int)(g_utc_base_ms - old_base));
-}
-
-static Now now_local() {
-  if (ntp_active()) {
-    const int64_t utc = g_utc_base_ms + mono_ms();
-    const time_t sec = (time_t)(utc / 1000);
-    struct tm tmv;
-    localtime_r(&sec, &tmv);
-    Now n;
-    n.y = tmv.tm_year + 1900; n.mo = tmv.tm_mon + 1; n.d = tmv.tm_mday;
-    n.h = tmv.tm_hour; n.mi = tmv.tm_min; n.s = tmv.tm_sec; n.ms = (int)(utc % 1000); n.wd = tmv.tm_wday;
-    return n;
-  }
-  const int64_t t = g_base_ms + mono_ms();
-  const int64_t days = t / 86400000LL;
-  const int64_t rem = t - days * 86400000LL;
-  Now n;
-  civil_from_days(days, n.y, n.mo, n.d);
-  n.h = (int)(rem / 3600000);
-  n.mi = (int)((rem / 60000) % 60);
-  n.s = (int)((rem / 1000) % 60);
-  n.ms = (int)(rem % 1000);
-  n.wd = (int)(((days % 7) + 11) % 7);
-  return n;
-}
-
-static void set_rtc(int y, int mo, int d, int h, int mi, int s) {
-  m5::rtc_datetime_t dt;
-  dt.date.year = y; dt.date.month = mo; dt.date.date = d;
-  dt.date.weekDay = weekday_of(y, mo, d);
-  dt.time.hours = h; dt.time.minutes = mi; dt.time.seconds = s;
-  M5.Rtc.setDateTime(dt);
-  g_synced = false;
-  g_resync = true;
-}
-
-// Keep the battery-backed RTC in step with NTP: write it exactly on a whole-second boundary so an
-// offline reboot starts within a few ms of the right time.
-static void rtc_backup_write() {
-  if (!g_rtc_write_utc_s) return;
-  const int64_t utc = g_utc_base_ms + mono_ms();
-  if (utc < g_rtc_write_utc_s * 1000) return;
-  if (utc < g_rtc_write_utc_s * 1000 + 100) {
-    const time_t sec = (time_t)g_rtc_write_utc_s;
-    struct tm t;
-    localtime_r(&sec, &t);
-    set_rtc(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
-    Serial.printf("rtc: written from NTP %04d-%02d-%02d %02d:%02d:%02d\n", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-                  t.tm_hour, t.tm_min, t.tm_sec);
-  }
-  g_rtc_write_utc_s = 0;
-}
-
-// Initialise the RTC from the build time when the firmware changed (or the RTC was never set).
-static void init_rtc_from_build(Preferences& prefs) {
-  static const char* const mon = "JanFebMarAprMayJunJulAugSepOctNovDec";
-  char m[4] = {__DATE__[0], __DATE__[1], __DATE__[2], 0};
-  const int mo = (int)((strstr(mon, m) - mon) / 3) + 1;
-  int d = 0, y = 0, h = 0, mi = 0, s = 0;
-  sscanf(__DATE__ + 4, "%d %d", &d, &y);
-  sscanf(__TIME__, "%d:%d:%d", &h, &mi, &s);
-
-  m5::rtc_datetime_t cur;
-  M5.Rtc.getDateTime(&cur);
-  const String stamp = String(__DATE__) + " " + __TIME__;
-  if (prefs.getString("build", "") != stamp || cur.date.year < 2025) {
-    set_rtc(y, mo, d, h, mi, s);
-    prefs.putString("build", stamp);
-    Serial.printf("RTC set from build time %04d-%02d-%02d %02d:%02d:%02d\n", y, mo, d, h, mi, s);
-  }
-}
+static bool g_dirty_all = true;
+static Preferences prefs;
+#include "timekeeping.h"
+#include "network.h"
 
 // ----------------------------------------------------------------------------------------------
 // LVGL <-> M5GFX glue
@@ -447,7 +134,8 @@ static void flush_cb(lv_display_t* disp, const lv_area_t* a, uint8_t* px) {
   lv_display_flush_ready(disp);
 }
 
-static void log_cb(lv_log_level_t, const char* msg) { Serial.print(msg); }
+static bool g_screenshot_active = false;
+static void log_cb(lv_log_level_t, const char* msg) { if (!g_screenshot_active) Serial.print(msg); }
 
 // The ESP-Hosted driver for the WiFi chip needs a big chunk of *internal* RAM for its SDIO buffer pool,
 // so the LVGL draw buffers live in PSRAM (internal RAM is the scarce resource here).
@@ -460,7 +148,6 @@ static void* alloc_draw_buf(size_t bytes) {
 // ----------------------------------------------------------------------------------------------
 // UI state
 // ----------------------------------------------------------------------------------------------
-static Preferences prefs;
 static int  g_theme = 0;
 static bool g_24h = true;
 
@@ -1049,11 +736,12 @@ static void render_static(int idx, uint32_t* painted = nullptr) {
 
 // The per-pixel painting of the other themes' backgrounds runs on core 0 at idle priority, one at a time; the UI
 // thread only has to snapshot + dither each one (~0.3 s).
-static uint32_t* volatile g_painted[N_THEMES];
+static std::atomic<uint32_t*> g_painted[N_THEMES];
 
-static void paint_task(void*) {
+static void paint_task(void* arg) {
+  const int initial_theme = (int)(intptr_t)arg;
   for (int i = 0; i < N_THEMES; i++) {
-    if (i == g_theme) continue;
+    if (i == initial_theme) continue;
     uint32_t* px = (uint32_t*)heap_caps_aligned_alloc(64, SCR_W * SCR_H * 4, MALLOC_CAP_SPIRAM);
     if (!px) break;
     paint_background(px, SCR_W, THEMES[i]);
@@ -1401,12 +1089,12 @@ static void update_minute(const Now& n, bool force) {
 static void update_battery() {
   // With no battery fitted the fuel gauge flips between bogus samples (~4.2 V / level 0) and a plausible one.
   // A real 2-cell pack is 6-8.4 V, so ignore anything lower and keep the last good reading on screen.
-  if (M5.Power.getBatteryVoltage() < 5500) return;
-  const int lvl = M5.Power.getBatteryLevel();
   // WiFi icon: bright in the accent colour while the time is NTP-synced, dim otherwise (tap it to set up WiFi)
   const bool synced = ntp_active();
   lv_obj_set_style_text_color(lbl_wifi, lv_color_hex(synced ? THEMES[g_theme].acc1 : THEMES[g_theme].ink), 0);
   lv_obj_set_style_text_opa(lbl_wifi, synced ? LV_OPA_COVER : LV_OPA_30, 0);
+  if (M5.Power.getBatteryVoltage() < 5500) return;
+  const int lvl = M5.Power.getBatteryLevel();
   if (lvl < 0) { lv_label_set_text(lbl_batt, ""); return; }
   const char* icon = lvl > 85 ? LV_SYMBOL_BATTERY_FULL : lvl > 60 ? LV_SYMBOL_BATTERY_3 : lvl > 35 ? LV_SYMBOL_BATTERY_2
                    : lvl > 10 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
@@ -1415,8 +1103,6 @@ static void update_battery() {
   snprintf(buf, sizeof(buf), "%s%s  %d%%", chg ? LV_SYMBOL_CHARGE "  " : "", icon, lvl);
   lv_label_set_text(lbl_batt, buf);
 }
-
-static bool g_dirty_all = true;
 
 static Stat st_upd, st_tap, st_rtc, st_ser, st_lv;
 static void stat_add(Stat& st, int64_t t0) {
@@ -1443,10 +1129,14 @@ static void set_theme(int idx, bool save = true) {
 }
 
 static void fast_cb(lv_timer_t*) {
-  static int last_s = -1, last_mi = -1, last_d = -1;
+  static int last_s = -1;
+  static int64_t last_mi = -1, last_d = -1;
   const Now n = now_local();
 
-  const bool force = g_dirty_all;
+  // DST can jump local time while UTC remains continuous. Repaint the entire day
+  // ring and hands after any discontinuity, not just its old/new endpoint sprites.
+  const int64_t minute = minute_key(n);
+  const bool force = g_dirty_all || (last_mi >= 0 && minute != last_mi && minute != last_mi + 1);
   if (force) {
     last_s = last_mi = last_d = -1;
     g_dirty_all = false;
@@ -1463,8 +1153,8 @@ static void fast_cb(lv_timer_t*) {
     snprintf(b, sizeof(b), "%02d s", n.s);
     lv_label_set_text(lbl_sec, b);
   }
-  if (n.mi != last_mi) { last_mi = n.mi; update_minute(n, force); }
-  if (n.d != last_d) { last_d = n.d; update_date(n); }
+  if (minute_key(n) != last_mi) { last_mi = minute_key(n); update_minute(n, force); }
+  if (date_key(n) != last_d) { last_d = date_key(n); update_date(n); }
   comp_apply();
 }
 
@@ -1487,6 +1177,8 @@ static int     g_wl_page = 0;                 // 0 = network list, 1 = password 
 static int     g_wl_count_at_connect = -1;    // g_ntp_count when the user pressed Connect (-1 = not waiting)
 static int64_t g_wl_close_at = 0;
 static char    g_sel_ssid[33];
+static ScanEntry g_wl_scan[MAX_SCAN]; // snapshot corresponding to the displayed rows
+static int g_wl_scan_n = 0;
 
 static lv_obj_t* wl_button(lv_obj_t* parent, const char* text, int x, int y, int w, int h, lv_event_cb_t cb,
                            uint32_t color, lv_obj_t** label_out = nullptr) {
@@ -1531,13 +1223,15 @@ static void wifi_close() {
 }
 
 static void wl_connect(const char* ssid, const char* pass) {
+  if (strlen(ssid) > 32 || strlen(pass) > 64) { lv_label_set_text(wl_status, "SSID or password too long"); return; }
+  ++g_net_generation;
   g_ssid = ssid;
   g_pass = pass;
   prefs.putString("ssid", g_ssid);
   prefs.putString("pass", g_pass);
   g_wl_count_at_connect = g_ntp_count;
   g_wl_close_at = 0;
-  g_net_cmd = 1;
+  net_request(1);
   char b[80];
   snprintf(b, sizeof(b), "Connecting to %s ...", ssid);
   lv_label_set_text(wl_status, b);
@@ -1545,9 +1239,9 @@ static void wl_connect(const char* ssid, const char* pass) {
 }
 
 static void wl_select(int idx) {
-  if (idx < 0 || idx >= g_scan_n) return;
-  strlcpy(g_sel_ssid, g_scan[idx].ssid, sizeof(g_sel_ssid));
-  if (!g_scan[idx].secure) { wl_connect(g_sel_ssid, ""); return; }
+  if (idx < 0 || idx >= g_wl_scan_n) return;
+  strlcpy(g_sel_ssid, g_wl_scan[idx].ssid, sizeof(g_sel_ssid));
+  if (!g_wl_scan[idx].secure) { wl_connect(g_sel_ssid, ""); return; }
   char b[80];
   snprintf(b, sizeof(b), "Password for  %s", g_sel_ssid);
   lv_label_set_text(wl_pw_title, b);
@@ -1561,7 +1255,9 @@ static void wl_row_cb(lv_event_t* e) { wl_select((int)(intptr_t)lv_event_get_use
 
 static void wl_rebuild_list() {
   lv_obj_clean(wl_list);
-  const int n = g_scan_n;
+  g_wl_scan_n = g_scan_n;
+  memcpy(g_wl_scan, g_scan, sizeof(g_wl_scan));
+  const int n = g_wl_scan_n;
   if (n == 0) {
     lv_obj_t* l = lv_label_create(wl_list);
     lv_obj_set_style_text_font(l, &lv_font_montserrat_28, 0);
@@ -1570,7 +1266,7 @@ static void wl_rebuild_list() {
     return;
   }
   for (int i = 0; i < n; i++) {
-    const ScanEntry& s = g_scan[i];
+    const ScanEntry& s = g_wl_scan[i];
     lv_obj_t* row = lv_button_create(wl_list);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, LV_PCT(100), 68);
@@ -1604,7 +1300,7 @@ static void wl_rebuild_list() {
 
 static void wl_a_cb(lv_event_t*) {  // "Scan" on the list page, "Back" on the password page
   if (g_wl_page == 1) { wl_show_page(0); return; }
-  g_net_cmd = 2;
+  net_request(2);
   lv_label_set_text(wl_status, "Scanning ...");
 }
 static void wl_close_cb(lv_event_t*) { wifi_close(); }
@@ -1652,7 +1348,7 @@ static void wifi_open() {
   lv_obj_move_foreground(wifi_ui);
   lv_timer_resume(g_wifi_timer);
   lv_timer_resume(lv_indev_get_read_timer(g_indev));
-  g_net_cmd = 2;  // scan right away
+  net_request(2);  // scan right away
 }
 
 static void wifi_build() {
@@ -1968,163 +1664,7 @@ static void display_set(bool on) {
 // ----------------------------------------------------------------------------------------------
 // Serial console (time sync, screenshots, debugging)
 // ----------------------------------------------------------------------------------------------
-static void send_screenshot() {
-  // The WiFi screen lives on the top layer, so snapshot it directly while it is open.
-  lv_draw_buf_t* snap = lv_snapshot_take(g_wifi_open ? wifi_ui : lv_screen_active(), LV_COLOR_FORMAT_RGB565);
-  if (!snap) { Serial.println("SNAPFAIL"); return; }
-  const uint32_t w = snap->header.w, h = snap->header.h, stride = snap->header.stride;
-  Serial.printf("SNAP %u %u\n", (unsigned)w, (unsigned)h);
-  for (uint32_t y = 0; y < h; y++) {
-    const uint8_t* row = (const uint8_t*)snap->data + y * stride;
-    size_t off = 0, len = w * 2;
-    while (off < len) {
-      const size_t k = Serial.write(row + off, min<size_t>(len - off, 512));
-      if (k == 0) delay(1);
-      off += k;
-    }
-  }
-  Serial.print("\nENDSNAP\n");
-  lv_draw_buf_destroy(snap);
-}
-
-// Same format as "P", but read back from the panel's frame buffer (what is really on the glass), rotated back
-// to landscape - verifies the PPA flush path.
-static void send_fb_screenshot() {
-  if (!g_fb) { Serial.println("SNAPFAIL"); return; }
-  esp_cache_msync(g_fb, FB_W * FB_H * 2, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-  Serial.printf("SNAP %d %d\n", SCR_W, SCR_H);
-  static uint16_t row[SCR_W];
-  for (int y = 0; y < SCR_H; y++) {
-    for (int x = 0; x < SCR_W; x++)
-      row[x] = g_rot == 1 ? g_fb[x * FB_W + (FB_W - 1 - y)] : g_fb[(FB_H - 1 - x) * FB_W + y];
-    size_t off = 0;
-    const uint8_t* p = (const uint8_t*)row;
-    while (off < sizeof(row)) {
-      const size_t k = Serial.write(p + off, min<size_t>(sizeof(row) - off, 512));
-      if (k == 0) delay(1);
-      off += k;
-    }
-  }
-  Serial.print("\nENDSNAP\n");
-}
-
-static void handle_serial() {
-  static char line[192];
-  static size_t len = 0;
-  while (Serial.available()) {
-    const char c = (char)Serial.read();
-    if (c != '\n' && c != '\r') {
-      if (len < sizeof(line) - 1) line[len++] = c;
-      continue;
-    }
-    line[len] = 0;
-    len = 0;
-    if (!line[0]) continue;
-    int y, mo, d, h, mi, s;
-    switch (line[0]) {
-      case 'T':
-        if (sscanf(line + 1, " %d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) {
-          set_rtc(y, mo, d, h, mi, s);
-          Serial.printf("OK time set %04d-%02d-%02d %02d:%02d:%02d\n", y, mo, d, h, mi, s);
-        } else {
-          Serial.println("ERR usage: T YYYY-MM-DD HH:MM:SS");
-        }
-        break;
-      case 'W': {  // "W ssid|password" stores WiFi credentials and syncs now; "W" alone clears them
-        const char* arg = line + 1;
-        while (*arg == ' ') arg++;
-        const char* bar = strchr(arg, '|');
-        g_ssid = bar ? String(arg).substring(0, bar - arg) : String(arg);
-        g_pass = bar ? String(bar + 1) : String("");
-        prefs.putString("ssid", g_ssid);
-        prefs.putString("pass", g_pass);
-        g_net_cmd = 1;
-        Serial.printf("OK wifi ssid='%s' (%u char password)\n", g_ssid.c_str(), (unsigned)g_pass.length());
-        break;
-      }
-      case 'Z': {  // "Z <POSIX TZ>", e.g. "Z PST8PDT,M3.2.0,M11.1.0"
-        const char* arg = line + 1;
-        while (*arg == ' ') arg++;
-        if (*arg) {
-          g_tz = arg;
-          prefs.putString("tz", g_tz);
-          setenv("TZ", g_tz.c_str(), 1);
-          tzset();
-        }
-        Serial.printf("OK tz=%s\n", g_tz.c_str());
-        break;
-      }
-      case 'U': if (g_wifi_open) wifi_close(); else wifi_open(); Serial.printf("OK wifi screen %s\n", g_wifi_open ? "open" : "closed"); break;
-      case 'Y': wl_select(atoi(line + 1)); Serial.println("OK select"); break;  // test: pick scan result n
-      case 'B': set_brightness(atoi(line + 1), true); g_bri_hide_at = mono_ms() + 60000; Serial.printf("OK brightness %d\n", g_bri); break;  // test: B <8-255>
-      case 'D': display_set(!g_disp_on); Serial.printf("OK display %s\n", g_disp_on ? "on" : "off"); break;              // test: toggle display
-      case 'N': g_net_cmd = 1; Serial.println("OK syncing"); break;
-      case 'Q': g_net_cmd = 2; Serial.println("OK scanning"); break;
-      case 'P': send_screenshot(); break;
-      case 'C': set_theme(g_theme + 1); Serial.printf("OK theme %d\n", g_theme); break;
-      case 'M':
-        g_24h = !g_24h;
-        prefs.putBool("h24", g_24h);
-        g_dirty_all = true;
-        Serial.printf("OK 24h=%d\n", g_24h);
-        break;
-      case 'S': {
-        const Now n = now_local();
-        Serial.printf("time %04d-%02d-%02d %02d:%02d:%02d.%03d synced=%d theme=%d 24h=%d\n", n.y, n.mo, n.d, n.h,
-                      n.mi, n.s, n.ms, g_synced, g_theme, g_24h);
-        Serial.printf("net: '%s' | ntp %s, %d syncs, last %ds ago | tz=%s | ssid=%s\n", g_net_state,
-                      ntp_active() ? "ACTIVE" : "off", g_ntp_count,
-                      g_ntp_valid ? (int)((mono_ms() - g_ntp_last_mono) / 1000) : -1, g_tz.c_str(),
-                      g_ssid.isEmpty() ? "(none)" : g_ssid.c_str());
-        Serial.printf("battery: level=%d voltage=%dmV current=%dmA charging=%d\n", (int)M5.Power.getBatteryLevel(),
-                      (int)M5.Power.getBatteryVoltage(), (int)M5.Power.getBatteryCurrent(), (int)M5.Power.isCharging());
-        Serial.printf("heap int=%u psram=%u | flushes=%u avg=%uus/flush %uus/kpx\n",
-                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)g_flush_n,
-                      g_flush_n ? g_flush_us / g_flush_n : 0, g_flush_px ? (uint32_t)((uint64_t)g_flush_us * 1000 / g_flush_px) : 0);
-        {
-          const int64_t win = esp_timer_get_time() - g_stat_t0;
-          Serial.printf("cpu busy %.1f%% | %.1f fps over %.1f s\n", win ? 100.0 * g_busy_us / win : 0.0,
-                        win ? g_frames * 1e6 / win : 0.0, win / 1e6);
-          g_busy_us = 0; g_frames = 0; g_stat_t0 = esp_timer_get_time();
-        }
-        g_flush_us = g_flush_px = g_flush_n = 0;
-        Serial.printf("max ms: update=%u touch=%u rtc=%u serial=%u lvgl=%u | >50ms: %u %u %u %u %u | rtc corr=%d maxjump=%dms reject=%d\n",
-                      st_upd.max_us / 1000, st_tap.max_us / 1000, st_rtc.max_us / 1000, st_ser.max_us / 1000,
-                      st_lv.max_us / 1000, st_upd.slow, st_tap.slow, st_rtc.slow, st_ser.slow, st_lv.slow,
-                      g_corr_n, g_corr_max_ms, g_reject_n);
-        Serial.print("slow frames by 5s-position (slow/total):");
-        for (int i = 0; i < 12; i++) Serial.printf(" %d:%u/%u", i * 5, g_slow_by_pos[i], g_frames_by_pos[i]);
-        Serial.println();
-        memset(g_slow_by_pos, 0, sizeof(g_slow_by_pos));
-        memset(g_frames_by_pos, 0, sizeof(g_frames_by_pos));
-        st_upd = st_tap = st_rtc = st_ser = st_lv = Stat();
-        g_corr_n = g_corr_max_ms = g_reject_n = 0;
-        break;
-      }
-      case 'K': g_auto_left = 20; g_auto_next = mono_ms() + 1000; Serial.println("OK stress: 20 theme switches / 3 s"); break;
-      case 'H': {  // debug: bitmask of things to disable: 1 day ring, 2 hand shadows, 4 soft shadow penumbra
-        const int m = atoi(line + 1);
-        g_show_ring = !(m & 1);
-        g_show_shadows = !(m & 2);
-        g_soft_shadows = !(m & 4);
-        g_comp_full = true;
-        lv_obj_invalidate(dial_obj);
-        Serial.printf("OK mask %d\n", m);
-        break;
-      }
-      case 'F': send_fb_screenshot(); break;
-      case 'A': {  // accelerometer + orientation (for checking ORIENT_AXIS / ORIENT_SIGN)
-        float x = 0, y = 0, z = 0;
-        if (g_imu_ok) M5.Imu.getAccel(&x, &y, &z);
-        Serial.printf("OK accel x=%.2f y=%.2f z=%.2f g | wants rotation %d, showing %d\n", x, y, z, orient_sample(), g_rot);
-        break;
-      }
-      case 'G': if (g_batt_open) batt_close(); else batt_open(); Serial.printf("OK battery card %s\n", g_batt_open ? "open" : "closed"); break;
-      default: Serial.println("ERR unknown command"); break;
-    }
-  }
-}
+#include "serial_console.h"
 
 // LVGL pointer input for the WiFi screen (the clock face itself is handled by handle_touch below)
 static void touch_read_cb(lv_indev_t*, lv_indev_data_t* d) {
@@ -2209,6 +1749,7 @@ static void handle_touch() {
 // ----------------------------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+  serial_logging_setup();
   Serial.setTxTimeoutMs(0);  // never block the UI when nobody is reading the USB port
   auto cfg = M5.config();
   cfg.output_power = false;   // don't power the 5 V external/USB-host outputs - nothing is plugged in there
@@ -2230,8 +1771,6 @@ void setup() {
   g_24h = prefs.getBool("h24", true);
   g_bri = (uint8_t)constrain((int)prefs.getUChar("bri", BRIGHTNESS), MIN_BRIGHTNESS, 255);
   M5.Display.setBrightness(g_bri);
-  if (M5.Rtc.isEnabled()) init_rtc_from_build(prefs);
-  else Serial.println("WARNING: no RTC found");
 
   g_ssid = prefs.getString("ssid", "");
   g_pass = prefs.getString("pass", "");
@@ -2239,7 +1778,8 @@ void setup() {
   setenv("TZ", g_tz.c_str(), 1);
   tzset();
   if (!g_ssid.isEmpty()) snprintf(g_net_state, sizeof(g_net_state), "waiting to sync");
-  xTaskCreatePinnedToCore(net_task, "net", 8192, nullptr, 1, nullptr, 0);
+  init_clock(prefs);
+  net_setup();
 
   lv_init();
   lv_tick_set_cb([]() -> uint32_t { return (uint32_t)(esp_timer_get_time() / 1000); });
@@ -2272,7 +1812,7 @@ void setup() {
   lv_timer_set_period(lv_indev_get_read_timer(g_indev), 16);
   lv_timer_pause(lv_indev_get_read_timer(g_indev));   // resumed while the WiFi screen is open
   set_theme(g_theme, false);                          // the other themes are rendered in the background later
-  xTaskCreatePinnedToCore(paint_task, "paint", 4096, nullptr, 0, nullptr, 0);
+  xTaskCreatePinnedToCore(paint_task, "paint", 4096, (void*)(intptr_t)g_theme, 0, nullptr, 0);
   update_battery();
   g_fast_timer = lv_timer_create(fast_cb, FRAME_MS, nullptr);
   lv_timer_create([](lv_timer_t*) { update_battery(); }, 20000, nullptr);
@@ -2287,8 +1827,10 @@ void loop() {
     M5.update();
     handle_touch();
     handle_serial();
-    net_apply();             // adopts the result of a manually requested sync, if any
-    delay(30);
+    net_apply();
+    const bool rtc_busy = poll_rtc();
+    rtc_backup_write();
+    delay(rtc_busy || g_rtc_write_utc_s ? 4 : 30);
     return;
   }
   int64_t t = esp_timer_get_time();
@@ -2320,6 +1862,6 @@ void loop() {
   g_busy_us += esp_timer_get_time() - t_loop;
   // Sleep until LVGL's next timer is due (the idle task halts the CPU meanwhile), but wake every TOUCH_MS to
   // poll the touch panel, and every 4 ms while phase-locking to the RTC.
-  uint32_t ms = min<uint32_t>(idle_ms, rtc_busy ? 4 : TOUCH_MS);
+  uint32_t ms = min<uint32_t>(idle_ms, (rtc_busy || g_rtc_write_utc_s) ? 4 : TOUCH_MS);
   delay(ms ? ms : 1);
 }
