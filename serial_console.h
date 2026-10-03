@@ -160,8 +160,8 @@ static void handle_serial() {
         Serial.printf("display=%d wifi_ui=%d brightness=%u rtc_pending=%lld\n", (int)g_disp_on.load(), (int)g_wifi_open,
                       (unsigned)g_bri, (long long)g_rtc_write_utc_s);
         Serial.printf("ui time=%s | date=%s | month=%s\n", lv_label_get_text(lbl_time), lv_label_get_text(lbl_date), lv_label_get_text(lbl_month));
-        Serial.printf("uptime_ms=%lld reset_reason=%d rtc_ready=%d battery_presence=%d usb_only=%d\n", (long long)mono_ms(),
-                      (int)esp_reset_reason(), (int)g_rtc_ready, (int)g_battery_presence.state, (int)g_usb_only);
+        Serial.printf("uptime_ms=%lld reset_reason=%d rtc_ready=%d rtc_lost=%d battery_presence=%d usb_only=%d\n", (long long)mono_ms(),
+                      (int)esp_reset_reason(), (int)g_rtc_ready, [] { bool l = false; return rtc_time_lost(l) ? (int)l : -1; }(), (int)g_battery_presence.state, (int)g_usb_only);
         Serial.printf("battery: level=%d voltage=%dmV current=%dmA charging=%d\n", (int)M5.Power.getBatteryLevel(),
                       (int)M5.Power.getBatteryVoltage(), (int)M5.Power.getBatteryCurrent(), (int)M5.Power.isCharging());
         Serial.printf("heap int=%u psram=%u | flushes=%u avg=%uus/flush %uus/kpx\n",

@@ -1256,9 +1256,10 @@ static void wifi_close() {
 
 static void wl_connect(const char* ssid, const char* pass) {
   if (strlen(ssid) > 32 || strlen(pass) > 64) { lv_label_set_text(wl_status, "SSID or password too long"); return; }
+  const String new_pass(pass);  // pass may point into g_pass (saved password reused)
   ++g_net_generation;
   g_ssid = ssid;
-  g_pass = pass;
+  g_pass = new_pass;
   prefs.putString("ssid", g_ssid);
   prefs.putString("pass", g_pass);
   g_wl_count_at_connect = g_ntp_count;
@@ -1270,6 +1271,12 @@ static void wl_connect(const char* ssid, const char* pass) {
   wl_show_page(0);
 }
 
+// A saved password is never put in the text area (Show would reveal it). A fixed stand-in shows
+// that one is saved; connecting unchanged reuses it, and the first edit replaces the stand-in.
+static constexpr const char* WL_SAVED_PW = "********";
+static bool g_wl_saved_pw = false;
+static const char* wl_password() { return g_wl_saved_pw ? g_pass.c_str() : lv_textarea_get_text(wl_ta); }
+
 static void wl_select(int idx) {
   if (idx < 0 || idx >= g_wl_scan_n) return;
   strlcpy(g_sel_ssid, g_wl_scan[idx].ssid, sizeof(g_sel_ssid));
@@ -1277,7 +1284,9 @@ static void wl_select(int idx) {
   char b[80];
   snprintf(b, sizeof(b), "Password for  %s", g_sel_ssid);
   lv_label_set_text(wl_pw_title, b);
-  lv_textarea_set_text(wl_ta, g_ssid == g_sel_ssid ? g_pass.c_str() : "");
+  g_wl_saved_pw = false;
+  lv_textarea_set_text(wl_ta, g_ssid == g_sel_ssid && !g_pass.isEmpty() ? WL_SAVED_PW : "");
+  g_wl_saved_pw = g_ssid == g_sel_ssid && !g_pass.isEmpty();
   lv_textarea_set_password_mode(wl_ta, true);
   lv_label_set_text(wl_btn_show_lbl, "Show");
   wl_show_page(1);
@@ -1341,9 +1350,16 @@ static void wl_show_cb(lv_event_t*) {
   lv_textarea_set_password_mode(wl_ta, pw);
   lv_label_set_text(wl_btn_show_lbl, pw ? "Show" : "Hide");
 }
-static void wl_connect_cb(lv_event_t*) { wl_connect(g_sel_ssid, lv_textarea_get_text(wl_ta)); }
+static void wl_ta_cb(lv_event_t*) {
+  if (!g_wl_saved_pw) return;
+  g_wl_saved_pw = false;  // keep only what was typed after the stand-in; a backspace clears it
+  const char* t = lv_textarea_get_text(wl_ta);
+  const size_t n = strlen(WL_SAVED_PW);
+  lv_textarea_set_text(wl_ta, strlen(t) > n && !strncmp(t, WL_SAVED_PW, n) ? String(t + n).c_str() : "");
+}
+static void wl_connect_cb(lv_event_t*) { wl_connect(g_sel_ssid, wl_password()); }
 static void wl_kb_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) == LV_EVENT_READY) wl_connect(g_sel_ssid, lv_textarea_get_text(wl_ta));
+  if (lv_event_get_code(e) == LV_EVENT_READY) wl_connect(g_sel_ssid, wl_password());
   else if (lv_event_get_code(e) == LV_EVENT_CANCEL) wl_show_page(0);
 }
 
@@ -1420,6 +1436,7 @@ static void wifi_build() {
   lv_textarea_set_one_line(wl_ta, true);
   lv_textarea_set_password_mode(wl_ta, true);
   lv_textarea_set_placeholder_text(wl_ta, "Password");
+  lv_obj_add_event_cb(wl_ta, wl_ta_cb, LV_EVENT_VALUE_CHANGED, nullptr);
   lv_textarea_set_max_length(wl_ta, 63);
   lv_obj_set_style_text_font(wl_ta, &lv_font_montserrat_28, 0);
   lv_obj_set_style_bg_color(wl_ta, lv_color_hex(0x161C38), 0);

@@ -23,8 +23,11 @@ struct rtc_datetime_t {
 };
 }
 struct FakeRTC {
-  bool enabled = true, read_ok = true, write_ok = true;
+  bool enabled = true, read_ok = true, write_ok = true, lost = false;
   int writes = 0;
+  FakeRTC* getRtcInstancePtr() { return enabled ? this : nullptr; }
+  bool readRegister(uint8_t, uint8_t* value, size_t) { if (!read_ok) return false; *value = lost ? 0x02 : 0; return true; }
+  bool writeRegister8(uint8_t, uint8_t value) { if (!write_ok) return false; if (!(value & 0x02)) lost = false; return true; }
   int64_t epoch = 0, written_at = fake_ms;
   bool isEnabled() { return enabled; }
   bool getDateTime(m5::rtc_datetime_t* dt) {
@@ -125,6 +128,16 @@ int main() {
   writes = M5.Rtc.writes;
   init_clock(failed_nvs);
   assert(g_rtc_ready && M5.Rtc.writes == writes && now_local().y == 2024);
+  // An RTC that lost power decodes as a valid date (here 2000-01-01) but must not be trusted.
+  Preferences powered_off; powered_off.values["rtc_utc"] = 1;
+  M5.Rtc.epoch = utc(2000, 1, 1, 0); M5.Rtc.written_at = fake_ms; M5.Rtc.lost = true;
+  init_clock(powered_off);
+  assert(g_rtc_ready && !M5.Rtc.lost && now_local().y >= 2025 && M5.Rtc.epoch > utc(2025, 1, 1, 0));
+  // Same for a legacy local-time RTC: seed instead of migrating garbage.
+  Preferences legacy_lost;
+  M5.Rtc.epoch = utc(2000, 1, 1, 0); M5.Rtc.written_at = fake_ms; M5.Rtc.lost = true;
+  init_clock(legacy_lost);
+  assert(g_rtc_ready && !M5.Rtc.lost && now_local().y >= 2025 && legacy_lost.getBool("rtc_utc", false));
   // No RTC still has a useful build-time clock.
   M5.Rtc.enabled = false;
   init_clock(prefs);

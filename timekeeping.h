@@ -26,6 +26,16 @@ static bool ntp_active() {
   return g_ntp_valid;
 }
 
+// RX8130 flag register 0x1D bit 1 (VLF): the oscillator stopped (power lost), so the time
+// registers are meaningless even when they decode. It is write-0-to-clear; writing 1 is ignored.
+static bool rtc_time_lost(bool& lost) {
+  uint8_t flags;
+  auto* rtc = M5.Rtc.getRtcInstancePtr();
+  if (!rtc || !rtc->readRegister(0x1D, &flags, 1)) return false;
+  lost = flags & 0x02;
+  return true;
+}
+
 static bool write_rtc_raw(time_t sec) {
   if (!M5.Rtc.isEnabled()) return false;
   struct tm t;
@@ -35,7 +45,7 @@ static bool write_rtc_raw(time_t sec) {
   M5.Rtc.setDateTime(dt);
   if (!M5.Rtc.getDateTime(&check)) return false;
   const int64_t delta = rtc_epoch_s(check) - sec;
-  return delta >= 0 && delta <= 1;
+  return delta >= 0 && delta <= 1 && M5.Rtc.getRtcInstancePtr()->writeRegister8(0x1D, 0xFD);  // clear VLF
 }
 
 // Journal a format change before touching the RTC. Until both the write and NVS
@@ -73,8 +83,14 @@ static void rtc_init_tick() {
       if (!write_rtc_utc((time_t)pending, false)) return;
     } else {
       m5::rtc_datetime_t cur;
-      if (!M5.Rtc.getDateTime(&cur)) return; // read failure is not permission to erase time
-      if (is_utc) {
+      bool lost;
+      if (!rtc_time_lost(lost)) return; // read failure is not permission to erase time
+      if (lost) {                         // power was lost: seed from the RAM estimate (build time or NTP)
+        if (!write_rtc_utc((time_t)(((g_ntp_valid ? g_utc_base_ms : g_base_ms) + mono_ms()) / 1000))) return;
+        Serial.println("rtc: lost power; seeded from current estimate");
+      } else if (!M5.Rtc.getDateTime(&cur)) {
+        return;
+      } else if (is_utc) {
         if (!g_ntp_valid) g_base_ms = rtc_epoch_s(cur) * 1000 - mono_ms();
         g_rtc_ready = true;
         if (g_clock_prefs->isKey("rtc_migrate")) g_clock_prefs->remove("rtc_migrate");

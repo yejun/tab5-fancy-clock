@@ -69,7 +69,8 @@ Three sources, best first:
    a legacy reading during the repeated fall DST hour is ambiguous; an NTP sync resolves that ambiguity.
    Failed I2C reads never overwrite the RTC. Failed migration writes or NVS commits are retried while
    RTC polling stays disabled, so local registers cannot be mistaken for UTC. NTP or the serial time
-   command can initialize an unreadable/invalid RTC once a write can be verified.
+   command can initialize an unreadable/invalid RTC once a write can be verified. If the RX8130 reports
+   that it lost power (VLF flag), its registers are ignored and it is reseeded from the build time.
    Downgrading to firmware that expects a local-time RTC is not supported without resetting its time.
 
     tools/clockctl.py scan                     # list WiFi networks (checks the radio works)
