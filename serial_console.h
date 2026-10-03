@@ -42,7 +42,7 @@ static void send_screenshot(bool framebuffer = false) {
   if ((framebuffer && !g_fb) || (!framebuffer && !snap)) { Serial.println("SNAPFAIL"); return; }
   const uint32_t w = framebuffer ? SCR_W : snap->header.w;
   const uint32_t h = framebuffer ? SCR_H : snap->header.h;
-  if (framebuffer) esp_cache_msync(g_fb, FB_W * FB_H * 2, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+  if (framebuffer) { flush_settle(); esp_cache_msync(g_fb, FB_W * FB_H * 2, ESP_CACHE_MSYNC_FLAG_DIR_M2C); }
   SerialClock clock;
   SerialStream out;
   const int64_t deadline = mono_ms() + 15000;
@@ -191,12 +191,13 @@ static void handle_serial() {
         break;
       }
       case 'K': g_auto_left = 20; g_auto_next = mono_ms() + 1000; Serial.println("OK stress: 20 theme switches / 3 s"); break;
-      case 'H': {  // debug: bitmask of things to disable: 1 day ring, 2 hand shadows, 4 soft shadow penumbra
+      case 'H': {  // debug: bitmask of things to disable: 1 day ring, 2 hand shadows, 4 soft shadow penumbra, 8 region merging, 16 async flush
         const int m = atoi(line + 1);
         g_show_ring = !(m & 1);
         g_show_shadows = !(m & 2);
         g_soft_shadows = !(m & 4);
         g_merge_regions = !(m & 8);
+        g_flush_async = !(m & 16);
         g_comp_full = true;
         lv_obj_invalidate(dial_obj);
         Serial.printf("OK mask %d\n", m);
@@ -221,6 +222,33 @@ static void handle_serial() {
         else { Serial.println("ERR usage: L on|off"); break; }
         Serial.printf("OK charge limit %s\n", g_charge_limit.enabled ? "80-90%" : "off");
         break;
+      case 'O': {  // shows: "O" lists them, "O <n>" starts one, "O x" stops, "O on|off" hourly schedule
+        const char* arg = line + 1;
+        while (*arg == ' ') arg++;
+        if (!*arg) {
+          for (int i = 0; i < N_SHOWS; i++) Serial.printf("  %d %s (%d ms)\n", i, SHOWS[i].name, SHOWS[i].duration_ms);
+          Serial.printf("OK %d shows, hourly %s, running %s\n", N_SHOWS, g_shows_enabled ? "on" : "off",
+                        g_show >= 0 ? SHOWS[g_show].name : "none");
+        } else if (*arg == 'x') { show_stop(); Serial.println("OK show stopped"); }
+        else if (!strcmp(arg, "on") || !strcmp(arg, "off")) {
+          g_shows_enabled = arg[1] == 'n';
+          prefs.putBool("shows", g_shows_enabled);
+          Serial.printf("OK hourly shows %s\n", g_shows_enabled ? "on" : "off");
+        } else {
+          const int i = atoi(arg);
+          if (i < 0 || i >= N_SHOWS || !g_disp_on || g_wifi_open) { Serial.println("ERR usage: O [n|x|on|off]; display on"); break; }
+          const char* sp = strchr(arg, ' ');
+          if (sp && g_show == i && g_show_freeze >= 0) { g_show_freeze = atof(sp + 1); Serial.printf("OK show %s at %.2f s\n", SHOWS[i].name, g_show_freeze); break; }
+          show_start(i);
+          if (sp) {   // run the frames up to t (so particle systems evolve), then hold
+            const float t = atof(sp + 1);
+            for (float f = 0; f < t; f += SHOW_FRAME_MS / 1000.0f) { g_show_freeze = f; SHOWS[i].tick(f); }
+            g_show_freeze = t;
+          }
+          Serial.printf("OK show %s%s\n", SHOWS[i].name, sp ? " (frozen)" : "");
+        }
+        break;
+      }
       case 'G': if (g_batt_open) batt_close(); else batt_open(); Serial.printf("OK battery card %s\n", g_batt_open ? "open" : "closed"); break;
       default: Serial.println("ERR unknown command"); break;
     }

@@ -79,6 +79,14 @@ static Preferences prefs;
 static lv_display_t* g_disp = nullptr;
 static uint32_t g_flush_us = 0, g_flush_px = 0, g_flush_n = 0, g_frames = 0;
 static int64_t  g_busy_us = 0, g_stat_t0 = 0;   // time loop() spent working (not sleeping) since the last "S"
+static bool g_show_running = false;       // a show is on: the second hand holds still (less to redraw, less to look at)
+static bool g_show_owns_dial = false;     // a show draws the dial straight into the frame buffer: LVGL keeps out
+static bool     g_frame_track = false;            // per-frame timing while a show runs (see shows.h)
+static int64_t  g_frame_last_us = 0, g_frame_worst_us = 0;
+static uint32_t g_frame_slow = 0;
+static int64_t  g_frame_active_us = 0;            // time covered by consecutive timed frames (holds excluded)
+static uint16_t g_slow_at_ms[12], g_slow_dt_ms[12];   // when (since tracking began) and how long, for the first slow frames
+static int64_t  g_frame_track_t0 = 0;
 
 // The panel is natively 720x1280 portrait and M5GFX keeps its frame buffer in PSRAM.  Rotating LVGL's landscape
 // strips into it pixel-by-pixel on the CPU (M5GFX pushImage) cost ~80 ns/pixel; the PPA's scale-rotate-mirror
@@ -88,13 +96,42 @@ static ppa_client_handle_t g_ppa = nullptr;
 static uint16_t* g_fb = nullptr;
 static int g_rot = ROTATION;   // current display rotation (1 or 3), changed by auto-rotation
 
+// The PPA works asynchronously: LVGL renders the next strip into its second buffer while the previous one is
+// rotated out. Completion is signalled from the PPA interrupt; LVGL's flush-wait callback blocks on it (the CPU
+// sleeps rather than spinning) only when it needs that buffer back.
+static SemaphoreHandle_t g_flush_done = nullptr;
+static volatile int64_t g_flush_t0 = 0;
+static bool g_flush_pending = false;
+static bool g_flush_async = true;      // debug mask H 16 turns this off for A/B measurements   // a PPA transfer was started and its completion not yet consumed
+
+static bool IRAM_ATTR ppa_done_isr(ppa_client_handle_t, ppa_event_data_t*, void*) {
+  g_flush_us += (uint32_t)(esp_timer_get_time() - g_flush_t0);
+  BaseType_t woken = pdFALSE;
+  xSemaphoreGiveFromISR(g_flush_done, &woken);
+  return woken == pdTRUE;
+}
+
+static void flush_wait_cb(lv_display_t*) {
+  if (!g_flush_pending) return;   // already waited for by flush_settle()
+  if (xSemaphoreTake(g_flush_done, pdMS_TO_TICKS(500)) != pdTRUE) Serial.println("WARNING: PPA flush timeout");
+  g_flush_pending = false;
+}
+static void flush_settle() { flush_wait_cb(nullptr); }   // the last strip has reached the frame buffer
+
 static void ppa_setup() {
   auto* panel = static_cast<lgfx::Panel_DSI*>(M5.Display.getPanel());
   g_fb = panel ? (uint16_t*)panel->config_detail().buffer : nullptr;
   ppa_client_config_t cfg = {};
   cfg.oper_type = PPA_OPERATION_SRM;
   cfg.max_pending_trans_num = 1;
-  if (!g_fb || ppa_register_client(&cfg, &g_ppa) != ESP_OK) { g_ppa = nullptr; Serial.println("PPA unavailable, using pushImage"); }
+  g_flush_done = xSemaphoreCreateBinary();
+  ppa_event_callbacks_t cbs = {};
+  cbs.on_trans_done = ppa_done_isr;
+  if (!g_fb || !g_flush_done || ppa_register_client(&cfg, &g_ppa) != ESP_OK ||
+      ppa_client_register_event_callbacks(g_ppa, &cbs) != ESP_OK) {
+    g_ppa = nullptr;
+    Serial.println("PPA unavailable, using pushImage");
+  }
 }
 
 static bool ppa_flush(const lv_area_t* a, const uint8_t* px, int w, int h) {
@@ -118,22 +155,46 @@ static bool ppa_flush(const lv_area_t* a, const uint8_t* px, int w, int h) {
     op.out.block_offset_y = FB_H - 1 - a->x2;
   }
   op.scale_x = op.scale_y = 1.0f;
-  op.mode = PPA_TRANS_MODE_BLOCKING;
-  return ppa_do_scale_rotate_mirror(g_ppa, &op) == ESP_OK;
+  op.mode = g_flush_async ? PPA_TRANS_MODE_NON_BLOCKING : PPA_TRANS_MODE_BLOCKING;
+  g_flush_t0 = esp_timer_get_time();
+  const bool ok = ppa_do_scale_rotate_mirror(g_ppa, &op) == ESP_OK;
+  if (!g_flush_async) { if (ok) xSemaphoreTake(g_flush_done, pdMS_TO_TICKS(100)); return false; }
+  g_flush_pending = ok;
+  return ok;
+}
+
+// A finished frame: counted, and timed while a show runs. Also called by shows that bypass LVGL (see shows.h).
+static void note_frame() {
+  g_frames++;
+  if (!g_frame_track) return;
+  const int64_t now = esp_timer_get_time();
+  if (g_frame_last_us) {
+    const int64_t dt = now - g_frame_last_us;
+    g_frame_active_us += dt;
+    if (dt > g_frame_worst_us) g_frame_worst_us = dt;
+    if (dt > 100000) {
+      if (g_frame_slow < 12) {
+        g_slow_at_ms[g_frame_slow] = (uint16_t)((now - g_frame_track_t0) / 1000);
+        g_slow_dt_ms[g_frame_slow] = (uint16_t)(dt / 1000);
+      }
+      g_frame_slow++;
+    }
+  }
+  g_frame_last_us = now;
 }
 
 static void flush_cb(lv_display_t* disp, const lv_area_t* a, uint8_t* px) {
   const int w = lv_area_get_width(a), h = lv_area_get_height(a);
-  const int64_t t0 = esp_timer_get_time();
-  if (!g_ppa || !ppa_flush(a, px, w, h)) {
-    M5.Display.startWrite();
-    M5.Display.pushImage(a->x1, a->y1, w, h, (const lgfx::rgb565_t*)px);
-    M5.Display.endWrite();
-  }
-  g_flush_us += (uint32_t)(esp_timer_get_time() - t0);
   g_flush_px += (uint32_t)(w * h);
   g_flush_n++;
-  if (lv_display_flush_is_last(disp)) g_frames++;
+  if (lv_display_flush_is_last(disp)) note_frame();
+  if (g_ppa && ppa_flush(a, px, w, h)) return;    // completes in ppa_done_isr / flush_wait_cb
+  if (g_ppa && !g_flush_async) { lv_display_flush_ready(disp); return; }   // blocking PPA transfer already done
+  const int64_t t0 = esp_timer_get_time();
+  M5.Display.startWrite();
+  M5.Display.pushImage(a->x1, a->y1, w, h, (const lgfx::rgb565_t*)px);
+  M5.Display.endWrite();
+  g_flush_us += (uint32_t)(esp_timer_get_time() - t0);
   lv_display_flush_ready(disp);
 }
 
@@ -445,7 +506,7 @@ static HOT void sky_at(const Theme& th, const Glow* glows, const Ribbon* ribs, c
 // smoothstep with a precomputed 1/(e1-e0): the sketch is built with -Os, so divisions are real divisions
 static inline float smooth_r(float e0, float inv, float v) { const float t = clamp01((v - e0) * inv); return t * t * (3 - 2 * t); }
 
-static HOT void dial_at(const DialCols& dc, float x, float y, float* c) {
+static HOT void dial_at(const DialCols& dc, float x, float y, float* c, bool shadow_only = false) {
   const float dx = x - CX, dy = y - CY, d2 = dx * dx + dy * dy;
   if (d2 > 345.0f * 345.0f) return;
   const float d = sqrtf(d2);
@@ -453,6 +514,7 @@ static HOT void dial_at(const DialCols& dc, float x, float y, float* c) {
 
   const float sy = dy - 20, ds2 = dx * dx + sy * sy;                   // drop shadow, offset downwards
   if (ds2 < 350.0f * 350.0f) mix_to(c, black, ds2 < 262.0f * 262.0f ? 0.55f : 0.55f * (1 - smooth_r(262, 1 / 88.0f, sqrtf(ds2))));
+  if (shadow_only) return;
   if (d < 301) {
     const float cov = clamp01(300.5f - d), t = d * (1 / 300.0f);
     mix_to(c, black, (0.30f + 0.36f * t * t) * cov);                 // smoked glass, darker towards the rim
@@ -490,7 +552,8 @@ static HOT void dial_at(const DialCols& dc, float x, float y, float* c) {
 }
 
 // Runs on the UI thread for the first theme and in paint_task (core 0) for the others: no LVGL calls in here.
-static HOT void paint_background(uint32_t* data, int stride_px, const Theme& th) {
+// Paints the screen area (x0, y0, w, h) into `data`; dial: 0 none, 1 only its drop shadow, 2 all of it.
+static HOT void paint_region(uint32_t* data, int stride_px, const Theme& th, int x0, int y0, int w, int h, int dial) {
   if (g_exp_lut[0] == 0) for (int i = 0; i < 1024; i++) g_exp_lut[i] = expf(-0.5f * i / 64.0f);
   const Glow glows[3] = {
     {CX, CY, 470, 470, 0.22f, th.acc3},                   // behind the dial
@@ -506,28 +569,29 @@ static HOT void paint_background(uint32_t* data, int stride_px, const Theme& th)
   const Rgba ik = rgba(th.ink, 1), a3 = rgba(th.acc3, 1);
   dc.ink[0] = ik.r; dc.ink[1] = ik.g; dc.ink[2] = ik.b;
   dc.acc3[0] = a3.r; dc.acc3[1] = a3.g; dc.acc3[2] = a3.b;
-  constexpr int S = 4, GW = SCR_W / S + 1, GH = SCR_H / S + 1;
+  constexpr int S = 4;
+  const int GW = w / S + 2, GH = h / S + 2;
   float* grid = (float*)heap_caps_malloc(sizeof(float) * 3 * GW * GH + sizeof(RibbonCol) * 2 * GW, MALLOC_CAP_SPIRAM);  // internal RAM is for WiFi
   if (!grid) return;
   RibbonCol* rcol = (RibbonCol*)(grid + 3 * GW * GH);
   for (int i = 0; i < GW; i++)
     for (int k = 0; k < 2; k++) {
       const Ribbon& r = ribs[k];
-      const float x = i * S;
+      const float x = x0 + i * S;
       RibbonCol& o = rcol[i * 2 + k];
       o.yc = r.y0 + r.slope * x + r.a1 * sinf(r.k1 * x + r.p1) + r.a2 * sinf(r.k2 * x + r.p2);
       o.amp = r.amp * (0.70f + 0.30f * sinf(r.k3 * x + r.p3)) * (0.93f + 0.07f * sinf(0.23f * x + 5 * r.p3));  // curtains
       o.w = r.w * (0.85f + 0.25f * sinf(0.0071f * x + r.p2));
     }
   for (int j = 0; j < GH; j++)
-    for (int i = 0; i < GW; i++) sky_at(th, glows, ribs, rcol + i * 2, i * S, j * S, grid + (j * GW + i) * 3);
+    for (int i = 0; i < GW; i++) sky_at(th, glows, ribs, rcol + i * 2, x0 + i * S, y0 + j * S, grid + (j * GW + i) * 3);
 
-  for (int y = 0; y < SCR_H; y++) {
+  for (int y = 0; y < h; y++) {
     const int gj = y / S;
     const float fy = (y % S) / (float)S;
     const float *g0 = grid + gj * GW * 3, *g1 = g0 + GW * 3;
     uint32_t* out = data + y * stride_px;
-    for (int x = 0; x < SCR_W; x++) {
+    for (int x = 0; x < w; x++) {
       const int gi = x / S;
       const float fx = (x % S) / (float)S;
       float c[3];
@@ -536,13 +600,15 @@ static HOT void paint_background(uint32_t* data, int stride_px, const Theme& th)
         const float b = g1[gi * 3 + k] + (g1[gi * 3 + 3 + k] - g1[gi * 3 + k]) * fx;
         c[k] = a + (b - a) * fy;
       }
-      if (x < CX + 346 && y > CY - 346 && y < CY + 346) dial_at(dc, x, y, c);
+      const int sx = x0 + x, sy = y0 + y;
+      if (dial && sx < CX + 346 && sy > CY - 346 && sy < CY + 346) dial_at(dc, sx, sy, c, dial == 1);
       out[x] = 0xFF000000u | ((uint32_t)(clamp01(c[0]) * 255 + 0.5f) << 16) |
                ((uint32_t)(clamp01(c[1]) * 255 + 0.5f) << 8) | (uint32_t)(clamp01(c[2]) * 255 + 0.5f);
     }
   }
   heap_caps_free(grid);
 }
+static void paint_background(uint32_t* data, int stride_px, const Theme& th) { paint_region(data, stride_px, th, 0, 0, SCR_W, SCR_H, 2); }
 
 // Bokeh: translucent discs with a faint rim (the ones under the calendar get blurred by its frosted glass)
 static void bokeh_draw_cb(lv_event_t* e) {
@@ -603,6 +669,13 @@ static void panel_deco_cb(lv_event_t* e) {
   }
 }
 
+// The dial numerals are part of the static artwork. For the "numerals take flight" show each theme also keeps the
+// artwork *behind* them (12 small patches), which the composite paints over the numerals while they are away.
+static lv_obj_t* g_num_objs[12][2];               // shadow + label, only valid while a static screen is built
+static lv_area_t g_num_rect[12];                  // numeral i+1 incl. its shadow, screen coordinates
+static lv_draw_buf_t* g_num_patch[N_THEMES][12];
+static bool g_hide_numerals = false;
+
 static lv_obj_t* build_static_screen(const Theme& th, const lv_draw_buf_t* bg) {
   lv_obj_t* s = lv_obj_create(nullptr);
   lv_obj_remove_style_all(s);
@@ -633,6 +706,9 @@ static lv_obj_t* build_static_screen(const Theme& th, const lv_draw_buf_t* bg) {
     const int y = (int)ry - lv_obj_get_height(l) / 2;
     lv_obj_set_pos(sh, (int)rx - 50 + 1, y + 3);
     lv_obj_set_pos(l, (int)rx - 50, y);
+    g_num_objs[i - 1][0] = sh;
+    g_num_objs[i - 1][1] = l;
+    g_num_rect[i - 1] = {(int32_t)rx - 50, y, (int32_t)rx - 50 + 100, y + (int32_t)lv_obj_get_height(l) + 2};
   }
 
   lv_obj_t* brand = mk_label(s, f_tiny, th.ink, 110, "TAB5", CX - 100, CY - 92, 200, LV_TEXT_ALIGN_CENTER);
@@ -693,18 +769,19 @@ static lv_obj_t* build_static_screen(const Theme& th, const lv_draw_buf_t* bg) {
 
 // RGB565 bands badly on smooth gradients, so the artwork is rendered in 32 bit and
 // ordered-dithered (4x4 Bayer) down to the RGB565 image that is actually displayed.
-static HOT lv_draw_buf_t* dither_to_rgb565(const lv_draw_buf_t* src) {
+// `x0`, `y0`, `w`, `h`: the part of `src` to convert (the Bayer pattern stays aligned to screen coordinates).
+static HOT lv_draw_buf_t* dither_to_rgb565(const lv_draw_buf_t* src, int x0 = 0, int y0 = 0, int w = 0, int h = 0) {
   static const uint8_t bayer[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
-  const uint32_t w = src->header.w, h = src->header.h;
+  if (!w) { w = src->header.w; h = src->header.h; }
   lv_draw_buf_t* dst = lv_draw_buf_create(w, h, LV_COLOR_FORMAT_RGB565, 0);
   if (!dst) return nullptr;
-  for (uint32_t y = 0; y < h; y++) {
-    const uint32_t* in = (const uint32_t*)((const uint8_t*)src->data + y * src->header.stride);
+  for (int y = 0; y < h; y++) {
+    const uint32_t* in = (const uint32_t*)((const uint8_t*)src->data + (y + y0) * src->header.stride) + x0;
     uint16_t* out = (uint16_t*)((uint8_t*)dst->data + y * dst->header.stride);
-    const uint8_t* brow = bayer[y & 3];
-    for (uint32_t x = 0; x < w; x++) {
+    const uint8_t* brow = bayer[(y + y0) & 3];
+    for (int x = 0; x < w; x++) {
       const uint32_t p = in[x];
-      const int t = brow[x & 3];
+      const int t = brow[(x + x0) & 3];
       const int add5 = (t * 8 + 4) >> 4, add6 = (t * 4 + 2) >> 4;
       const int r = min(255, (int)((p >> 16) & 0xFF) + add5) >> 3;
       const int g = min(255, (int)((p >> 8) & 0xFF) + add6) >> 2;
@@ -727,6 +804,15 @@ static void render_static(int idx, uint32_t* painted = nullptr) {
     static lv_draw_buf_t bg;
     lv_draw_buf_init(&bg, SCR_W, SCR_H, LV_COLOR_FORMAT_XRGB8888, SCR_W * 4, px, SCR_W * SCR_H * 4);
     lv_obj_t* s = build_static_screen(THEMES[idx], &bg);
+    for (auto& o : g_num_objs) { lv_obj_add_flag(o[0], LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(o[1], LV_OBJ_FLAG_HIDDEN); }
+    if (lv_draw_buf_t* bare = lv_snapshot_take(s, LV_COLOR_FORMAT_XRGB8888)) {
+      for (int i = 0; i < 12; i++) {
+        const lv_area_t& r = g_num_rect[i];
+        g_num_patch[idx][i] = dither_to_rgb565(bare, r.x1, r.y1, r.x2 - r.x1 + 1, r.y2 - r.y1 + 1);
+      }
+      lv_draw_buf_destroy(bare);
+    }
+    for (auto& o : g_num_objs) { lv_obj_remove_flag(o[0], LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(o[1], LV_OBJ_FLAG_HIDDEN); }
     full = lv_snapshot_take(s, LV_COLOR_FORMAT_XRGB8888);
     lv_obj_delete(s);
     lv_image_cache_drop(&bg);
@@ -835,6 +921,12 @@ static void comp_draw(lv_layer_t* L) {
   img.src = g_static_bufs[g_theme];
   const lv_area_t scr = {0, 0, SCR_W - 1, SCR_H - 1};
   if (img.src) lv_draw_image(L, &img, &scr);
+  if (g_hide_numerals)
+    for (int i = 0; i < 12; i++)
+      if (g_num_patch[g_theme][i] && clip_hit(L, g_num_rect[i].x1, g_num_rect[i].y1, g_num_rect[i].x2, g_num_rect[i].y2)) {
+        img.src = g_num_patch[g_theme][i];
+        lv_draw_image(L, &img, &g_num_rect[i]);
+      }
 
   // Day ring - skipped unless this area actually touches the ring annulus
   if (g_show_ring) {
@@ -858,6 +950,7 @@ static void comp_draw(lv_layer_t* L) {
 // Re-composite the queued areas (or everything) and invalidate them on screen.
 static void comp_apply() {
   if (!g_comp_full && !g_comp_n) return;
+  if (g_show_owns_dial) return;   // queued until the show hands the dial back
   if (g_merge_regions && !g_comp_full) merge_dirty_regions(g_comp_box, g_comp_n);
   lv_layer_t layer;
   lv_canvas_init_layer(comp_canvas, &layer);
@@ -1175,6 +1268,8 @@ static void set_theme(int idx, bool save = true) {
                 (int)((t2 - t1) / 1000), (int)((esp_timer_get_time() - t2) / 1000));
 }
 
+static void shows_update(const Now& n);   // shows.h
+
 static void fast_cb(lv_timer_t*) {
   static int last_s = -1;
   static int64_t last_mi = -1, last_d = -1;
@@ -1190,18 +1285,19 @@ static void fast_cb(lv_timer_t*) {
     g_comp_full = true;
     lv_obj_invalidate(secbar_obj);
   }
-  set_seconds(n.s + n.ms / 1000.0f, force);
+  if (!g_show_running || force) set_seconds(n.s + n.ms / 1000.0f, force);
   if (n.s != last_s) {
     last_s = n.s;
     // The hour/minute hands move well under a pixel per second: step the minute hand every 3 s and the hour
     // hand every 30 s.
-    if (force || n.s % 3 == 0) set_hands_hm(n, force || n.s % 30 == 0, force);
+    if (!g_show_owns_dial && (force || n.s % 3 == 0)) set_hands_hm(n, force || n.s % 30 == 0, force);
     char b[8];
     snprintf(b, sizeof(b), "%02d s", n.s);
     lv_label_set_text(lbl_sec, b);
   }
   if (minute_key(n) != last_mi) { last_mi = minute_key(n); update_minute(n, force); }
   if (date_key(n) != last_d) { last_d = date_key(n); update_date(n); }
+  shows_update(n);
   comp_apply();
 }
 
@@ -1646,8 +1742,12 @@ static int orient_sample() {
   return g > 0 ? 1 : 3;
 }
 
+static void show_stop();   // shows.h
+
 static void set_rotation(int r) {
   if (r == g_rot) return;
+  show_stop();               // the shows that draw straight into the frame buffer depend on the orientation
+  flush_settle();
   g_rot = r;
   M5.Display.setRotation(r);
   lv_obj_invalidate(lv_screen_active());   // the whole screen, all layers
@@ -1742,6 +1842,7 @@ static void display_set(bool on) {
     lv_timer_ready(g_fast_timer);   // run the clock update on the next handler pass
     lv_timer_handler();
     lv_refr_now(g_disp);            // render + flush everything now
+    flush_settle();
     M5.Display.setBrightness(g_bri);
   } else {
     batt_close();
@@ -1754,6 +1855,7 @@ static void display_set(bool on) {
 // ----------------------------------------------------------------------------------------------
 // Serial console (time sync, screenshots, debugging)
 // ----------------------------------------------------------------------------------------------
+#include "shows.h"
 #include "serial_console.h"
 
 // LVGL pointer input for the WiFi screen (the clock face itself is handled by handle_touch below)
@@ -1768,6 +1870,7 @@ static void touch_read_cb(lv_indev_t*, lv_indev_data_t* d) {
 
 // A confirmed single tap on the clock face.
 static void run_tap(int x, int y) {
+  if (g_show_running) { show_stop(); return; }   // a tap ends a show (and does nothing else)
   if (g_batt_open) {
     if (x >= BC_X && x < BC_X + BC_W && y >= BC_Y + 220 && y < BC_Y + 252)
       set_battery_mode(!g_usb_only);
@@ -1865,6 +1968,7 @@ void setup() {
   g_24h = prefs.getBool("h24", true);
   g_usb_only = prefs.getBool("batt_usb", false);
   g_charge_limit.enabled = prefs.getBool("chg_lim", true);
+  g_shows_enabled = prefs.getBool("shows", true);
   g_bri = (uint8_t)constrain((int)prefs.getUChar("bri", BRIGHTNESS), MIN_BRIGHTNESS, 255);
   M5.Display.setBrightness(g_bri);
 
@@ -1884,6 +1988,7 @@ void setup() {
   g_disp = lv_display_create(SCR_W, SCR_H);
   lv_display_set_color_format(g_disp, LV_COLOR_FORMAT_RGB565);
   lv_display_set_flush_cb(g_disp, flush_cb);
+  if (g_ppa) lv_display_set_flush_wait_cb(g_disp, flush_wait_cb);
   const size_t buf_px = SCR_W * 64;
   void* b1 = alloc_draw_buf(buf_px * 2);
   void* b2 = alloc_draw_buf(buf_px * 2);
@@ -1902,6 +2007,7 @@ void setup() {
   wifi_build();
   bri_build();
   batt_build();
+  shows_build();
   g_indev = lv_indev_create();
   lv_indev_set_type(g_indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(g_indev, touch_read_cb);
@@ -1954,7 +2060,7 @@ void loop() {
     g_frames_by_pos[pos]++;
     if (esp_timer_get_time() - t > 40000) g_slow_by_pos[pos]++;
   }
-  if (!g_wifi_open) render_pending_themes();
+  if (!g_wifi_open && !g_show_running) render_pending_themes();   // a ~0.5 s stall: not mid-show
   g_busy_us += esp_timer_get_time() - t_loop;
   // Sleep until LVGL's next timer is due (the idle task halts the CPU meanwhile), but wake every TOUCH_MS to
   // poll the touch panel, and every 4 ms while phase-locking to the RTC.

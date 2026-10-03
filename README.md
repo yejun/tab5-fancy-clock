@@ -2,7 +2,7 @@
 
 LVGL 9.x + M5GFX/M5Unified, 1280x720 landscape.
 
-![Fancy Clock on the Tab5](docs/screenshot.png)
+![Fancy Clock on the Tab5, mid-way through the hourly fireworks](docs/screenshot.png)
 
 Requires: Arduino CLI, the `m5stack:esp32` core (3.3.x), and the libraries `lvgl` (9.x), `M5GFX`, `M5Unified`.
 The current code builds with core 3.3.9, LVGL 9.6.0, M5GFX 0.2.30 and M5Unified 0.2.23.
@@ -32,15 +32,42 @@ then `mise run test | flash | device-test`. Without mise: `python3 -m venv .venv
   the glass never turns it. Only the accelerometer runs (the gyro is switched off); it is read 5x a second while the
   display is on. A turn is one full redraw - LVGL keeps drawing in landscape, only the PPA flush rotates differently.
 
+## Hourly shows
+On the hour (07:00-22:00; `O off` disables them) the clock plays one of six short shows, picked at random. The second
+hand holds still while one runs; a tap ends it. Measured on the device while animating (fps, worst frame):
+
+| Show | | fps | worst |
+|---|---|---|---|
+| `sweep` | a sheen crosses the calendar card, a glint with a tail runs round the bezel | 25-27 | 61 ms |
+| `fireworks` | rockets burst into streaking sparks over the dial | 21-23 | 78 ms |
+| `numerals` | the numerals lift off, orbit on a tilted ring in perspective and land again | 15-16 | 93 ms |
+| `flap` | the big digits become a split-flap board and cascade to the time | 28 | 56 ms |
+| `dialflip` | the dial turns over in 3D to a back face with the time and date, and back | 23 | 63 ms |
+| `aurora` | a curtain of light ripples across the top of the screen | 17 | 62 ms |
+
+How they stay fast:
+- **Core 0 does the pixel work** one frame ahead (double-buffered); core 1 runs LVGL as usual.
+- **Fireworks** splat all sparks into one off-screen buffer (saturating add of small glow kernels) that LVGL blends
+  once, in a few boxes that follow the bursts - cost no longer grows with the number of sparks.
+- **Numerals** are pre-scaled to 17 sizes when the show starts (LVGL's software transform is ~0.6 us/pixel);
+  the artwork *behind* them is kept per theme as 12 small patches, painted in while they fly.
+- **Dial flip and aurora bypass LVGL** for their region and write the panel's frame buffer directly: the panel is
+  portrait, so a screen column is one contiguous frame-buffer row, and both effects work column by column on
+  column-major data. Routing a full-dial image through LVGL and the PPA every frame saturated PSRAM (~10 fps).
+- Serial: `O` lists the shows, `O <n>` plays one and prints its frame statistics, `O <n> <t>` holds it at t seconds
+  (for screenshots), `O x` stops, `O on|off` turns the hourly schedule on or off.
+
 ## Rendering / power
-With the display on, the CPU is busy ~20% of the time (it was ~80% at 27 fps before this pipeline):
+With the display on, the CPU is busy ~19% of the time (it was ~80% at 27 fps before this pipeline):
 - **Static artwork** per theme is rendered once into an RGB565 image: the smooth background and radial dial parts are
   painted per pixel in float (the other themes on core 0 in the background after boot), LVGL draws the crisp details
   on top in 32 bit, then it is dithered (4x4 Bayer) to RGB565.
 - **Composite**: static artwork + day ring + hour/minute hands, re-drawn only where those move (every 3 s / 30 s / 60 s).
 - **Per frame** (66 ms) only the second hand, its tip and the hub are drawn on top of the composite, and only inside
   short boxes that follow the hand (not its whole bounding box). Glows are pre-computed sprites, not LVGL box shadows.
-- **Flush**: the rotation into the panel's portrait frame buffer is done by the P4's PPA (DMA), not the CPU.
+- **Flush**: the rotation into the panel's portrait frame buffer is done by the P4's PPA (DMA), not the CPU, and
+  asynchronously: LVGL renders the next strip while the PPA rotates the previous one (a full-dial redraw went from 15
+  to 20 fps). `H 16` switches back to blocking flushes for comparison.
 - **Idle**: `loop()` sleeps until LVGL's next timer is due and polls touch every 25 ms; LVGL's own touch input is only
   polled while the WiFi screen is open.
 - `S` prints `cpu busy N% | fps` since the previous `S`. Note newlib's float trig goes through soft double on the P4,
