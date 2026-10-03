@@ -40,7 +40,9 @@
  * - LV_STDLIB_RTTHREAD:    RT-Thread implementation
  * - LV_STDLIB_CUSTOM:      Implement the functions externally
  */
-#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CLIB
+/* Keep widget/font caches out of the internal RAM needed by ESP-Hosted WiFi.
+ * Implemented by lvgl_memory.cpp; DMA draw buffers have their own allocator. */
+#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CUSTOM
 
 /** Possible values
  * - LV_STDLIB_BUILTIN:     LVGL's built in implementation

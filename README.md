@@ -23,7 +23,8 @@ then `mise run test | flash | device-test`. Without mise: `python3 -m venv .venv
     Tab5: panel sleep also disables touch, and 40 MHz starves the MIPI-DSI controller. See comments in the code.)
   - **Tap the big digits** → 12h/24h. **Tap the WiFi icon** (top right) → WiFi setup. **Tap the battery icon** →
     a card with level, charging state, voltage (pack and per cell), current, power and a rough time-left /
-    time-to-full estimate (2000 mAh pack, smoothed current); refreshed every second, the next tap anywhere closes it. **Tap anywhere else** → next theme
+    time-to-full estimate (2000 mAh pack, smoothed current); refreshed every second. Tap the bottom row to switch the battery display between Auto and USB only;
+    other taps close the card. USB-only installations no longer show a phantom full battery. **Tap anywhere else** → next theme
     (Aurora, Sunset, Ocean, Jade, Graphite). Single taps act after a ~0.35 s pause so they can't be confused with a double-tap.
 
 - **Auto-rotate**: turn the Tab5 upside-down and the picture follows (landscape and landscape upside-down only).
@@ -62,10 +63,13 @@ Three sources, best first:
    time is NTP-synced. Daylight saving is automatic because the timezone is a POSIX TZ string.
 2. **RTC** - every NTP sync also writes the Tab5's RX8130 (on a whole-second boundary), in UTC, preserving timezone and daylight-saving behavior offline.
    Missed write windows and RTC write failures are retried, including with the display off. Without NTP for 24 h the clock falls back to the RTC.
-3. **Build time** - used only when no valid RTC is available. `tools/build.sh` embeds a UTC build timestamp;
+3. **Build time** - used as an in-memory estimate when the RTC cannot be read. `tools/build.sh` embeds a UTC build timestamp;
    reflashing preserves a valid RTC. The first boot of this version migrates older local-time RTC contents
    using the saved timezone and records the UTC format in NVS. Like any local time without an offset,
    a legacy reading during the repeated fall DST hour is ambiguous; an NTP sync resolves that ambiguity.
+   Failed I2C reads never overwrite the RTC. Failed migration writes or NVS commits are retried while
+   RTC polling stays disabled, so local registers cannot be mistaken for UTC. NTP or the serial time
+   command can initialize an unreadable/invalid RTC once a write can be verified.
    Downgrading to firmware that expects a local-time RTC is not supported without resetting its time.
 
     tools/clockctl.py scan                     # list WiFi networks (checks the radio works)
@@ -82,8 +86,9 @@ POSIX TZ examples: `EST5EDT,M3.2.0,M11.1.0` (US Eastern), `GMT0BST,M3.5.0/1,M10.
     tools/clockctl.py cmd S|C|M      # status+timing stats / next theme / toggle 12-24h
     tools/clockctl.py cmd A          # accelerometer reading and the orientation it asks for
     tools/clockctl.py cmd G          # open/close the battery card
+    tools/clockctl.py cmd "V usb"    # saved USB-only display (no battery fitted); "V auto" restores detection
     tools/clockctl.py cmd K          # stress test: 20 automatic theme switches
-    tools/clockctl.py cmd H<mask>    # debug: 1=hide day ring 2=hand shadows 4=soft shadow penumbra
+    tools/clockctl.py cmd H<mask>    # debug: 1=hide day ring 2=hand shadows 4=soft shadow penumbra 8=region merging
     tools/clockctl.py log 5          # device log
     tools/make_fonts.sh              # regenerate fonts.h (Noto Sans subset, OFL)
 
@@ -112,15 +117,31 @@ Update firmware and `clockctl.py` together for this protocol change.
     tools/test.sh                             # C++ sanitizer tests + Python protocol tests; no hardware needed
     tools/build.sh upload /dev/ttyACM0         # build and flash the connected device
     tools/clockctl.py --port /dev/ttyACM0 cmd S # status, including display and RTC backup state
-    tools/device_test.py --port /dev/ttyACM0   # device integration/stress tests (~3 minutes)
+    tools/device_test.py --port /dev/ttyACM0   # device integration/stress tests (~5 minutes)
 
 `CLOCK_PORT` can also select the port for `clockctl.py`. The device runner temporarily changes time,
 timezone, display state and 12/24-hour format, restoring settings and computer time in a `finally` block.
-It leaves saved WiFi credentials intact and skips NTP checks if none are configured. It verifies both
+It leaves saved WiFi credentials intact and skips NTP checks if none are configured. It verifies repeated WiFi setup/scan/close cycles and both
 screenshot paths, correction-driven UI updates, offline DST, screenshot backpressure recovery, RTC
-backup during display sleep, and 20 theme changes. Touch gestures, physical rotation, panel appearance,
+backup during display sleep, 20 theme changes, and twelve calendar months followed by another WiFi scan
+with an internal-memory reserve check. Touch gestures, physical rotation, panel appearance,
 and RTC retention across a real power cycle still need hands-on checks.
 
 Raw time commands: `E <UTC epoch seconds>` sets UTC directly; `T YYYY-MM-DD HH:MM:SS` interprets local
 time in the configured timezone and rejects invalid dates and the spring DST gap. Either invalidates
 an older in-flight NTP result. The `Z` command immediately refreshes the display in the new timezone.
+
+Battery Auto mode requires eight seconds of plausible pack voltage before displaying a percentage.
+The Tab5 charger can produce plausible readings with no pack, so Auto remains an estimate; select
+USB only on the battery card for permanent USB-powered installations. This is a display preference
+and does not alter charger settings. Both the header and detail card use the same sampled state.
+`S` includes uptime, reset reason, RTC readiness and the battery display mode for troubleshooting.
+
+LVGL widget/font allocations use PSRAM through `lvgl_memory.cpp`, leaving internal RAM available for
+WiFi and device drivers even after visiting many dates and screens. DMA draw buffers retain their
+separate aligned allocator. Overlapping clock redraw regions are merged only when doing so does not
+increase the total number of pixels drawn.
+
+`SOURCE_DATE_EPOCH` optionally fixes the embedded build timestamp, which also lets repeated verification
+builds reuse the Arduino library cache. Visual captures and measurements can be saved in the ignored
+`artifacts/` directory; unlike the Arduino `build/` directory, it survives subsequent builds.

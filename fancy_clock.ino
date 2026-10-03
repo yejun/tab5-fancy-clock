@@ -31,6 +31,9 @@
 #include <esp_log.h>
 #include "fonts.h"
 #include "types.h"
+#include "dirty_regions.h"
+#include "battery_state.h"
+#include <esp_system.h>
 
 // ----------------------------------------------------------------------------------------------
 // Configuration
@@ -191,6 +194,7 @@ static constexpr int MAX_COMP_BOX = 24;
 static lv_area_t g_comp_box[MAX_COMP_BOX];
 static int  g_comp_n = 0;
 static bool g_comp_full = true;
+static bool g_merge_regions = true;
 
 // ----------------------------------------------------------------------------------------------
 // Small widget / drawing helpers
@@ -766,6 +770,7 @@ static void inv_box(float x1, float y1, float x2, float y2) {    // redraw this 
 }
 
 static void comp_box(float x1, float y1, float x2, float y2) {   // re-composite (and then redraw) this area
+  if (g_merge_regions && g_comp_n == MAX_COMP_BOX) merge_dirty_regions(g_comp_box, g_comp_n);
   if (g_comp_n == MAX_COMP_BOX) { g_comp_full = true; return; }
   lv_area_t& a = g_comp_box[g_comp_n++];
   a.x1 = max(0, (int)floorf(x1)); a.y1 = max(0, (int)floorf(y1));
@@ -853,6 +858,7 @@ static void comp_draw(lv_layer_t* L) {
 // Re-composite the queued areas (or everything) and invalidate them on screen.
 static void comp_apply() {
   if (!g_comp_full && !g_comp_n) return;
+  if (g_merge_regions && !g_comp_full) merge_dirty_regions(g_comp_box, g_comp_n);
   lv_layer_t layer;
   lv_canvas_init_layer(comp_canvas, &layer);
   if (g_comp_full) {
@@ -947,6 +953,7 @@ static void apply_dynamic_theme() {
   lv_obj_set_style_text_color(lbl_time, lv_color_hex(th.ink), 0);
   lv_obj_set_style_text_color(lbl_date, lv_color_hex(th.ink), 0);
   lv_obj_set_style_text_color(lbl_batt, lv_color_hex(th.ink), 0);
+  lv_obj_set_style_text_color(lbl_wifi, lv_color_hex(ntp_active() ? th.acc1 : th.ink), 0);
   lv_obj_set_style_text_color(lbl_ampm, lv_color_hex(th.acc2), 0);
   lv_obj_set_style_text_color(lbl_sec, lv_color_hex(th.acc2), 0);
   lv_obj_set_style_bg_color(today_mark, lv_color_hex(th.acc1), 0);
@@ -981,7 +988,7 @@ static void build_dynamic_ui() {
 
   // Right-hand panel: greeting, time, date, seconds
   lbl_greet = mk_label(scr, f_head, 0xFFFFFF, LV_OPA_COVER, "", PX + 4, 30, 400);
-  lv_obj_set_style_text_letter_space(lbl_greet, 5, 0);
+  lv_obj_set_style_text_letter_space(lbl_greet, 4, 0);
   lv_obj_set_width(lbl_greet, 330);  // keep clear of the WiFi/battery icons on the right
   lbl_batt = mk_label(scr, &lv_font_montserrat_20, 0xFFFFFF, 190, "", PX + PW - 190, 36, 180, LV_TEXT_ALIGN_RIGHT);
   lbl_wifi = mk_label(scr, &lv_font_montserrat_20, 0xFFFFFF, LV_OPA_30, LV_SYMBOL_WIFI, PX + PW - 170, 36, 40);
@@ -1086,22 +1093,47 @@ static void update_minute(const Now& n, bool force) {
   lv_label_set_text(lbl_greet, g);
 }
 
+static BatteryPresence g_battery_presence;
+static bool g_usb_only = false; // display preference for installations with no battery pack
+static int g_battery_mv = 0, g_battery_ma = 0, g_battery_level = 0;
+static bool g_battery_charging = false;
+static int64_t g_battery_sample_at = -1000;
+
+static void sample_battery() {
+  if (mono_ms() - g_battery_sample_at < 500) return;
+  g_battery_sample_at = mono_ms();
+  if (g_usb_only) { g_battery_presence.state = BatteryPresence::Absent; return; }
+  g_battery_mv = M5.Power.getBatteryVoltage();
+  g_battery_presence.update(g_battery_mv, g_battery_sample_at);
+  if (g_battery_presence.state == BatteryPresence::Present) {
+    g_battery_ma = M5.Power.getBatteryCurrent();
+    // Same voltage-based estimate as M5Unified, using this sample rather than
+    // a second sensor read that may disagree with the presence measurement.
+    g_battery_level = constrain((g_battery_mv / 2 - 3300) * 100 / 800, 0, 100);
+    g_battery_charging = M5.Power.isCharging() == m5::Power_Class::is_charging;
+  }
+}
+
 static void update_battery() {
-  // With no battery fitted the fuel gauge flips between bogus samples (~4.2 V / level 0) and a plausible one.
-  // A real 2-cell pack is 6-8.4 V, so ignore anything lower and keep the last good reading on screen.
-  // WiFi icon: bright in the accent colour while the time is NTP-synced, dim otherwise (tap it to set up WiFi)
+  sample_battery();
   const bool synced = ntp_active();
-  lv_obj_set_style_text_color(lbl_wifi, lv_color_hex(synced ? THEMES[g_theme].acc1 : THEMES[g_theme].ink), 0);
-  lv_obj_set_style_text_opa(lbl_wifi, synced ? LV_OPA_COVER : LV_OPA_30, 0);
-  if (M5.Power.getBatteryVoltage() < 5500) return;
-  const int lvl = M5.Power.getBatteryLevel();
-  if (lvl < 0) { lv_label_set_text(lbl_batt, ""); return; }
-  const char* icon = lvl > 85 ? LV_SYMBOL_BATTERY_FULL : lvl > 60 ? LV_SYMBOL_BATTERY_3 : lvl > 35 ? LV_SYMBOL_BATTERY_2
-                   : lvl > 10 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
-  const bool chg = M5.Power.isCharging() == m5::Power_Class::is_charging;
+  static int last_theme = -1, last_synced = -1;
+  if (last_theme != g_theme || last_synced != (int)synced) {
+    lv_obj_set_style_text_color(lbl_wifi, lv_color_hex(synced ? THEMES[g_theme].acc1 : THEMES[g_theme].ink), 0);
+    lv_obj_set_style_text_opa(lbl_wifi, synced ? LV_OPA_COVER : LV_OPA_30, 0);
+    last_theme = g_theme; last_synced = synced;
+  }
   char buf[48];
-  snprintf(buf, sizeof(buf), "%s%s  %d%%", chg ? LV_SYMBOL_CHARGE "  " : "", icon, lvl);
-  lv_label_set_text(lbl_batt, buf);
+  if (g_battery_presence.state != BatteryPresence::Present) {
+    snprintf(buf, sizeof(buf), "%s", g_battery_presence.state == BatteryPresence::Absent ? LV_SYMBOL_USB "  USB" : "...");
+  } else {
+    const int lvl = g_battery_level;
+    const char* icon = lvl > 85 ? LV_SYMBOL_BATTERY_FULL : lvl > 60 ? LV_SYMBOL_BATTERY_3 : lvl > 35 ? LV_SYMBOL_BATTERY_2
+                     : lvl > 10 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
+    snprintf(buf, sizeof(buf), "%s%s  %d%%", g_battery_charging ? LV_SYMBOL_CHARGE "  " : "", icon, lvl);
+  }
+  // Polling presence must not redraw an unchanged header twice per second.
+  if (strcmp(lv_label_get_text(lbl_batt), buf)) lv_label_set_text(lbl_batt, buf);
 }
 
 static Stat st_upd, st_tap, st_rtc, st_ser, st_lv;
@@ -1245,7 +1277,7 @@ static void wl_select(int idx) {
   char b[80];
   snprintf(b, sizeof(b), "Password for  %s", g_sel_ssid);
   lv_label_set_text(wl_pw_title, b);
-  lv_textarea_set_text(wl_ta, "");
+  lv_textarea_set_text(wl_ta, g_ssid == g_sel_ssid ? g_pass.c_str() : "");
   lv_textarea_set_password_mode(wl_ta, true);
   lv_label_set_text(wl_btn_show_lbl, "Show");
   wl_show_page(1);
@@ -1432,23 +1464,29 @@ static void wifi_build() {
 // It sits clear of everything that is redrawn per frame, so while it is open it only costs its own 1 s refresh.
 // ----------------------------------------------------------------------------------------------
 static constexpr int BATT_MAH = 2000;          // the Tab5's NP-F550-type pack (2 cells in series), for the time estimate
-static constexpr int BC_W = 380, BC_H = 236, BC_X = PX + PW - BC_W, BC_Y = 74;
-static lv_obj_t *batt_ui, *batt_pct, *batt_state, *batt_bar, *batt_keys, *batt_vals;
+static constexpr int BC_W = 380, BC_H = 266, BC_X = PX + PW - BC_W, BC_Y = 74;
+static lv_obj_t *batt_ui, *batt_pct, *batt_state, *batt_bar, *batt_keys, *batt_vals, *batt_mode_lbl;
 static lv_timer_t* g_batt_timer = nullptr;
 static bool  g_batt_open = false;
 static float g_batt_ma = NAN;                  // smoothed current (+ = charging), for the time estimate
 
 static void batt_refresh(lv_timer_t*) {
   const Theme& th = THEMES[g_theme];
-  const int mv = M5.Power.getBatteryVoltage(), lvl = M5.Power.getBatteryLevel();
-  const float ma = M5.Power.getBatteryCurrent();
-  const bool chg = M5.Power.isCharging() == m5::Power_Class::is_charging;
+  lv_label_set_text(batt_mode_lbl, g_usb_only ? "Battery display: USB only  (tap to change)" : "Battery display: Auto  (tap to change)");
+  sample_battery();
+  const int mv = g_battery_mv, lvl = g_battery_level;
+  const float ma = g_battery_ma;
+  const bool chg = g_battery_charging;
   char b[128];
-  if (mv < 5500 || lvl < 0) {                  // no pack fitted (see update_battery)
+  if (g_battery_presence.state != BatteryPresence::Present) {
     lv_label_set_text(batt_pct, "--");
-    lv_label_set_text(batt_state, "No battery");
+    const bool absent = g_battery_presence.state == BatteryPresence::Absent;
+    lv_label_set_text(batt_state, absent ? "USB power" : "Checking battery");
+    lv_obj_set_style_text_color(batt_state, lv_color_hex(th.ink), 0);
+    lv_label_set_text(batt_keys, "Power source\nBattery\n\n");
     lv_bar_set_value(batt_bar, 0, LV_ANIM_OFF);
-    lv_label_set_text(batt_vals, "-\n-\n-\n-");
+    lv_label_set_text(batt_vals, g_usb_only ? "USB\nNot fitted\n\n" : absent ? "USB\nNot detected\n\n" : "--\nChecking...\n\n");
+    g_batt_ma = NAN;
     return;
   }
   g_batt_ma = isnan(g_batt_ma) ? ma : g_batt_ma + (ma - g_batt_ma) * 0.2f;   // the reading jumps with the CPU load
@@ -1496,6 +1534,7 @@ static void batt_build() {
   lv_obj_set_style_bg_opa(batt_bar, LV_OPA_COVER, LV_PART_INDICATOR);
   batt_keys = mk_label(batt_ui, f_small, 0xFFFFFF, 150, "", 24, 96, 140);
   batt_vals = mk_label(batt_ui, f_small, 0xFFFFFF, 235, "", 120, 96, BC_W - 144, LV_TEXT_ALIGN_RIGHT);
+  batt_mode_lbl = mk_label(batt_ui, f_tiny, 0xFFFFFF, 180, "", 24, 234, BC_W - 48, LV_TEXT_ALIGN_CENTER);
   g_batt_timer = lv_timer_create(batt_refresh, 1000, nullptr);
   lv_timer_pause(g_batt_timer);
 }
@@ -1513,6 +1552,15 @@ static void batt_open() {
   lv_obj_remove_flag(batt_ui, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(batt_ui);
   lv_timer_resume(g_batt_timer);
+}
+
+static void set_battery_mode(bool usb_only) {
+  g_usb_only = usb_only;
+  prefs.putBool("batt_usb", usb_only);
+  g_battery_presence = BatteryPresence();
+  g_battery_sample_at = -1000;
+  update_battery();
+  if (g_batt_open) batt_refresh(nullptr);
 }
 
 static void batt_close() {
@@ -1678,8 +1726,10 @@ static void touch_read_cb(lv_indev_t*, lv_indev_data_t* d) {
 
 // A confirmed single tap on the clock face.
 static void run_tap(int x, int y) {
-  if (g_batt_open) {                                // any tap closes the battery card
-    batt_close();
+  if (g_batt_open) {
+    if (x >= BC_X && x < BC_X + BC_W && y >= BC_Y + 220 && y < BC_Y + BC_H)
+      set_battery_mode(!g_usb_only);
+    else batt_close();
   } else if (x >= PX + PW - 128 && y < 90) {        // battery icon (top right)
     batt_open();
   } else if (x >= PX + PW - 260 && y < 90) {        // WiFi icon, left of it
@@ -1769,6 +1819,7 @@ void setup() {
   prefs.begin("clock", false);
   g_theme = prefs.getInt("theme", 0) % N_THEMES;
   g_24h = prefs.getBool("h24", true);
+  g_usb_only = prefs.getBool("batt_usb", false);
   g_bri = (uint8_t)constrain((int)prefs.getUChar("bri", BRIGHTNESS), MIN_BRIGHTNESS, 255);
   M5.Display.setBrightness(g_bri);
 
@@ -1815,7 +1866,7 @@ void setup() {
   xTaskCreatePinnedToCore(paint_task, "paint", 4096, (void*)(intptr_t)g_theme, 0, nullptr, 0);
   update_battery();
   g_fast_timer = lv_timer_create(fast_cb, FRAME_MS, nullptr);
-  lv_timer_create([](lv_timer_t*) { update_battery(); }, 20000, nullptr);
+  lv_timer_create([](lv_timer_t*) { update_battery(); }, 500, nullptr);
   // the fuel gauge can report 0% right after power-up, so read it again shortly after boot
   lv_timer_set_repeat_count(lv_timer_create([](lv_timer_t*) { update_battery(); }, 3000, nullptr), 1);
   Serial.printf("UI ready, heap int=%u psram=%u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),

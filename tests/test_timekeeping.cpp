@@ -47,10 +47,11 @@ static struct {
 } Serial;
 struct Preferences {
   std::map<std::string, int64_t> values;
+  bool writes_ok = true, marker_ok = true;
   bool getBool(const char* key, bool fallback) { return values.count(key) ? values[key] != 0 : fallback; }
   int64_t getLong64(const char* key, int64_t fallback) { return values.count(key) ? values[key] : fallback; }
-  size_t putLong64(const char* key, int64_t value) { values[key] = value; return 8; }
-  size_t putBool(const char* key, bool value) { values[key] = value; return 1; }
+  size_t putLong64(const char* key, int64_t value) { if (!writes_ok) return 0; values[key] = value; return 8; }
+  size_t putBool(const char* key, bool value) { if (!writes_ok || !marker_ok) return 0; values[key] = value; return 1; }
   bool isKey(const char* key) { return values.count(key); }
   void remove(const char* key) { values.erase(key); }
 };
@@ -77,6 +78,53 @@ int main() {
   init_clock(interrupted);
   assert(M5.Rtc.epoch == utc(2026, 10, 1, 19));
   assert(interrupted.getBool("rtc_utc", false));
+  // Failed reads must never turn into writes of build time.
+  M5.Rtc.epoch = utc(2026, 10, 2, 21); M5.Rtc.written_at = fake_ms;
+  M5.Rtc.read_ok = false;
+  writes = M5.Rtc.writes;
+  init_clock(prefs);
+  assert(!g_rtc_ready && M5.Rtc.writes == writes);
+  fake_ms += 1000;
+  assert(!poll_rtc() && M5.Rtc.writes == writes);
+  M5.Rtc.read_ok = true;
+  fake_ms += 1000;
+  rtc_init_tick();
+  assert(g_rtc_ready && M5.Rtc.writes == writes && now_local().h == 14);
+  // Failed legacy conversion must not expose the still-local registers as UTC.
+  Preferences failed_migration;
+  M5.Rtc.epoch = utc(2026, 10, 1, 12); M5.Rtc.written_at = fake_ms;
+  M5.Rtc.write_ok = false;
+  init_clock(failed_migration);
+  assert(!g_rtc_ready && now_local().h == 12);
+  assert(!poll_rtc() && now_local().h == 12);
+  fake_ms += 2000;
+  M5.Rtc.write_ok = true;
+  rtc_init_tick();
+  assert(g_rtc_ready && now_local().h == 12 && failed_migration.getBool("rtc_utc", false));
+  // Failure to persist the migration journal must leave the legacy RTC untouched.
+  Preferences failed_nvs; failed_nvs.writes_ok = false;
+  M5.Rtc.epoch = utc(2026, 10, 1, 12); M5.Rtc.written_at = fake_ms;
+  writes = M5.Rtc.writes;
+  init_clock(failed_nvs);
+  assert(!g_rtc_ready && M5.Rtc.writes == writes && now_local().h == 12);
+  fake_ms += 1000; failed_nvs.writes_ok = true;
+  rtc_init_tick();
+  assert(g_rtc_ready && now_local().h == 12);
+  // RTC may already contain UTC when committing the NVS format marker fails.
+  // Retrying must use the journal, not convert those registers for a second time.
+  Preferences failed_marker; failed_marker.marker_ok = false;
+  M5.Rtc.epoch = utc(2026, 10, 1, 12); M5.Rtc.written_at = fake_ms;
+  init_clock(failed_marker);
+  assert(!g_rtc_ready && now_local().h == 12 && M5.Rtc.epoch == utc(2026, 10, 1, 19));
+  assert(!poll_rtc());
+  fake_ms += 1000; failed_marker.marker_ok = true;
+  rtc_init_tick();
+  assert(g_rtc_ready && now_local().h == 12 && M5.Rtc.epoch == utc(2026, 10, 1, 19, 0, 1));
+  // Valid dates accepted by the console also survive reboot (including before 2025).
+  assert(set_utc_time(utc(2024, 2, 29, 20)));
+  writes = M5.Rtc.writes;
+  init_clock(failed_nvs);
+  assert(g_rtc_ready && M5.Rtc.writes == writes && now_local().y == 2024);
   // No RTC still has a useful build-time clock.
   M5.Rtc.enabled = false;
   init_clock(prefs);

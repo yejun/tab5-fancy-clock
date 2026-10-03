@@ -8,6 +8,9 @@ static constexpr int64_t NTP_VALID_MS = 24LL * 60 * 60 * 1000;
 static bool g_ntp_valid = false;
 static int64_t g_utc_base_ms = 0, g_ntp_last_mono = 0, g_rtc_write_utc_s = 0;
 static int g_ntp_count = 0;
+static Preferences* g_clock_prefs = nullptr;
+static bool g_rtc_ready = false, g_migration_active = false;
+static int64_t g_migration_base_ms = 0, g_rtc_init_next = 0;
 
 static inline int64_t mono_ms() { return esp_timer_get_time() / 1000; }
 static int64_t rtc_epoch_s(const m5::rtc_datetime_t& dt) {
@@ -23,7 +26,7 @@ static bool ntp_active() {
   return g_ntp_valid;
 }
 
-static bool write_rtc_utc(time_t sec) {
+static bool write_rtc_raw(time_t sec) {
   if (!M5.Rtc.isEnabled()) return false;
   struct tm t;
   gmtime_r(&sec, &t);
@@ -33,6 +36,60 @@ static bool write_rtc_utc(time_t sec) {
   if (!M5.Rtc.getDateTime(&check)) return false;
   const int64_t delta = rtc_epoch_s(check) - sec;
   return delta >= 0 && delta <= 1;
+}
+
+// Journal a format change before touching the RTC. Until both the write and NVS
+// marker are confirmed, no reader may interpret the hardware registers as UTC.
+static bool write_rtc_utc(time_t sec, bool journal = true) {
+  if (!M5.Rtc.isEnabled() || !g_clock_prefs) return false;
+  if (!g_rtc_ready) {
+    if (journal && !g_clock_prefs->putLong64("rtc_migrate", sec)) return false;
+    g_migration_base_ms = (int64_t)sec * 1000 - mono_ms();
+    g_migration_active = true;
+  }
+  if (!write_rtc_raw(sec)) return false;
+  if (!g_rtc_ready && !g_clock_prefs->putBool("rtc_utc", true)) return false;
+  g_rtc_ready = true;
+  g_migration_active = false;
+  if (g_clock_prefs->isKey("rtc_migrate")) g_clock_prefs->remove("rtc_migrate");
+  return true;
+}
+
+// Retry initialization without ever treating an unreadable RTC as an empty one.
+// A build-time estimate runs in RAM while I2C is unavailable. NTP/manual setting
+// can initialize even a corrupt RTC, but must verify the write before trusting it.
+static void rtc_init_tick() {
+  if (g_rtc_ready || !g_clock_prefs || !M5.Rtc.isEnabled() || mono_ms() < g_rtc_init_next) return;
+  g_rtc_init_next = mono_ms() + 1000;
+  if (g_migration_active) {
+    if (!write_rtc_utc((time_t)((g_migration_base_ms + mono_ms()) / 1000), false)) return;
+  } else {
+    const bool is_utc = g_clock_prefs->getBool("rtc_utc", false);
+    const int64_t pending = g_clock_prefs->getLong64("rtc_migrate", 0);
+    if (pending && !is_utc) {
+      g_migration_base_ms = pending * 1000 - mono_ms();
+      g_migration_active = true;
+      if (!g_ntp_valid) g_base_ms = g_migration_base_ms;
+      if (!write_rtc_utc((time_t)pending, false)) return;
+    } else {
+      m5::rtc_datetime_t cur;
+      if (!M5.Rtc.getDateTime(&cur)) return; // read failure is not permission to erase time
+      if (is_utc) {
+        if (!g_ntp_valid) g_base_ms = rtc_epoch_s(cur) * 1000 - mono_ms();
+        g_rtc_ready = true;
+        if (g_clock_prefs->isKey("rtc_migrate")) g_clock_prefs->remove("rtc_migrate");
+      } else {
+        time_t utc;
+        if (!local_epoch(cur.date.year, cur.date.month, cur.date.date,
+                         cur.time.hours, cur.time.minutes, cur.time.seconds, utc)) return;
+        if (!g_ntp_valid) g_base_ms = (int64_t)utc * 1000 - mono_ms();
+        if (!write_rtc_utc(utc)) return;
+        Serial.println("rtc: migrated local time to UTC");
+      }
+    }
+  }
+  g_resync = true;
+  g_dirty_all = true;
 }
 
 static void adopt_ntp(int64_t utc_ms, int64_t sampled_mono) {
@@ -82,7 +139,8 @@ static bool poll_rtc() {   // returns true while phase-locking (wants a 4 ms pol
   static int64_t last_poll = 0, prev_done = 0, next_sync = 0, sync_start = 0;
   static int prev_sec = -1;
   const int64_t t0 = mono_ms();
-  if (!M5.Rtc.isEnabled() || ntp_active()) return false;                  // NTP is the master clock
+  rtc_init_tick();
+  if (!g_rtc_ready || !M5.Rtc.isEnabled() || ntp_active()) return false;                  // NTP is the master clock
 
   if (g_resync) { syncing = false; have_prev = false; }
   if (!syncing) {
@@ -139,28 +197,12 @@ static void init_clock(Preferences& prefs) {
   local_epoch(y, (strstr(months, mon) - months) / 3 + 1, d, h, mi, sec, build_utc);
 #endif
   g_base_ms = (int64_t)build_utc * 1000 - mono_ms();
-  m5::rtc_datetime_t cur;
-  const bool valid = M5.Rtc.isEnabled() && M5.Rtc.getDateTime(&cur) && cur.date.year >= 2025;
-  const bool is_utc = prefs.getBool("rtc_utc", false);
-  if (valid && is_utc) {
-    if (prefs.isKey("rtc_migrate")) prefs.remove("rtc_migrate");
-    g_base_ms = rtc_epoch_s(cur) * 1000 - mono_ms();
-    return;
-  }
-  time_t seed = build_utc;
-  const int64_t pending = prefs.getLong64("rtc_migrate", 0);
-  if (pending) seed = (time_t)pending;
-  else if (valid && !local_epoch(cur.date.year, cur.date.month, cur.date.date,
-                                cur.time.hours, cur.time.minutes, cur.time.seconds, seed)) {
-    Serial.println("rtc: invalid legacy local time; using build UTC");
-    seed = build_utc;
-  }
-  g_base_ms = (int64_t)seed * 1000 - mono_ms();
-  if (!M5.Rtc.isEnabled()) { Serial.println("WARNING: no RTC; using build UTC"); return; }
-  if (prefs.putLong64("rtc_migrate", seed) && write_rtc_utc(seed) && prefs.putBool("rtc_utc", true)) {
-    prefs.remove("rtc_migrate");
-    Serial.println(valid ? "rtc: migrated local time to UTC" : "rtc: seeded from build UTC");
-  } else {
-    Serial.println("WARNING: RTC initialization failed");
-  }
+  g_clock_prefs = &prefs;
+  g_rtc_ready = false;
+  g_migration_active = false;
+  g_rtc_init_next = 0;
+  g_synced = false;
+  g_resync = true;
+  rtc_init_tick();
+  if (!g_rtc_ready) Serial.println("rtc: waiting for readable UTC clock; using RAM estimate");
 }

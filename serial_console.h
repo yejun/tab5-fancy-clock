@@ -160,6 +160,8 @@ static void handle_serial() {
         Serial.printf("display=%d wifi_ui=%d brightness=%u rtc_pending=%lld\n", (int)g_disp_on.load(), (int)g_wifi_open,
                       (unsigned)g_bri, (long long)g_rtc_write_utc_s);
         Serial.printf("ui time=%s | date=%s | month=%s\n", lv_label_get_text(lbl_time), lv_label_get_text(lbl_date), lv_label_get_text(lbl_month));
+        Serial.printf("uptime_ms=%lld reset_reason=%d rtc_ready=%d battery_presence=%d usb_only=%d\n", (long long)mono_ms(),
+                      (int)esp_reset_reason(), (int)g_rtc_ready, (int)g_battery_presence.state, (int)g_usb_only);
         Serial.printf("battery: level=%d voltage=%dmV current=%dmA charging=%d\n", (int)M5.Power.getBatteryLevel(),
                       (int)M5.Power.getBatteryVoltage(), (int)M5.Power.getBatteryCurrent(), (int)M5.Power.isCharging());
         Serial.printf("heap int=%u psram=%u | flushes=%u avg=%uus/flush %uus/kpx\n",
@@ -192,6 +194,7 @@ static void handle_serial() {
         g_show_ring = !(m & 1);
         g_show_shadows = !(m & 2);
         g_soft_shadows = !(m & 4);
+        g_merge_regions = !(m & 8);
         g_comp_full = true;
         lv_obj_invalidate(dial_obj);
         Serial.printf("OK mask %d\n", m);
@@ -204,6 +207,12 @@ static void handle_serial() {
         Serial.printf("OK accel x=%.2f y=%.2f z=%.2f g | wants rotation %d, showing %d\n", x, y, z, orient_sample(), g_rot);
         break;
       }
+      case 'V':
+        if (!strcmp(line + 1, " usb")) set_battery_mode(true);
+        else if (!strcmp(line + 1, " auto")) set_battery_mode(false);
+        else { Serial.println("ERR usage: V usb|auto"); break; }
+        Serial.printf("OK battery display %s\n", g_usb_only ? "USB only" : "Auto");
+        break;
       case 'G': if (g_batt_open) batt_close(); else batt_open(); Serial.printf("OK battery card %s\n", g_batt_open ? "open" : "closed"); break;
       default: Serial.println("ERR unknown command"); break;
     }

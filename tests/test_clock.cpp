@@ -1,5 +1,7 @@
 #include "clock_logic.h"
 #include "serial_transfer.h"
+#include "dirty_regions.h"
+#include "battery_state.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -93,5 +95,42 @@ int main() {
   FakeStream slow{clock, 1, 500, {}};
   assert(!serial_write_all(slow, clock, digits, 9, 2000));
   assert(clock.ms == 2000); // absolute deadline also bounds a slowly progressing host
+  BatteryPresence battery;
+  for (int ms = 0; ms < 30000; ms += 500) {
+    battery.update(ms % 3000 < 1000 ? 4250 : 8400, ms);
+    assert(battery.state != BatteryPresence::Present); // charger with no pack
+  }
+  for (int ms = 30000; ms <= 39000; ms += 500) battery.update(7600, ms);
+  assert(battery.state == BatteryPresence::Present); // stable inserted pack
+  battery.update(4250, 39500);
+  assert(battery.state == BatteryPresence::Absent); // pack removed
+  struct Area { int x1, y1, x2, y2; };
+  Area boxes[] = {{0,0,9,9}, {0,5,9,14}, {30,30,39,39}};
+  int count = 3;
+  merge_dirty_regions(boxes, count);
+  assert(count == 2 && boxes[0].y2 == 14);
+  // Randomized coverage/property check: every old pixel survives, total work never grows.
+  unsigned random = 42;
+  auto next = [&]() { random = random * 1664525u + 1013904223u; return random; };
+  for (int run = 0; run < 1000; ++run) {
+    Area original[24], merged[24];
+    int64_t before_area = 0, after_area = 0;
+    for (int i = 0; i < 24; ++i) {
+      int x = next() % 80, y = next() % 80;
+      original[i] = merged[i] = {x, y, x + (int)(next() % 20), y + (int)(next() % 20)};
+      before_area += (original[i].x2-x+1) * (original[i].y2-y+1);
+    }
+    int n = 24; merge_dirty_regions(merged, n);
+    for (int i = 0; i < n; ++i) after_area += (merged[i].x2-merged[i].x1+1) * (merged[i].y2-merged[i].y1+1);
+    assert(after_area <= before_area);
+    for (auto& a : original) {
+      bool covered = false;
+      for (int j = 0; j < n; ++j) {
+        const Area& b = merged[j];
+        covered |= b.x1 <= a.x1 && b.y1 <= a.y1 && b.x2 >= a.x2 && b.y2 >= a.y2;
+      }
+      assert(covered);
+    }
+  }
   puts("Clock/calendar, DST, migration, refresh keys, RTC deadlines, CRC and serial backpressure: PASS");
 }
