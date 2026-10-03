@@ -1096,7 +1096,7 @@ static void update_minute(const Now& n, bool force) {
 static BatteryPresence g_battery_presence;
 static bool g_usb_only = false; // display preference for installations with no battery pack
 static int g_battery_mv = 0, g_battery_ma = 0, g_battery_level = 0;
-static bool g_battery_charging = false;
+static bool g_battery_charging = false, g_battery_external = false;
 static int64_t g_battery_sample_at = -1000;
 
 static void sample_battery() {
@@ -1110,7 +1110,10 @@ static void sample_battery() {
     // Same voltage-based estimate as M5Unified, using this sample rather than
     // a second sensor read that may disagree with the presence measurement.
     g_battery_level = constrain((g_battery_mv / 2 - 3300) * 100 / 800, 0, 100);
-    g_battery_charging = M5.Power.isCharging() == m5::Power_Class::is_charging;
+    // CHG_STAT (what isCharging() reads) floats "charging" with USB unplugged, so use the pack current
+    // instead: measured ~+680 mA charging, ~0 mA full on USB, ~-150 mA running on the battery.
+    g_battery_charging = g_battery_ma > 20;
+    g_battery_external = g_battery_ma > -30;
   }
 }
 
@@ -1130,7 +1133,7 @@ static void update_battery() {
     const int lvl = g_battery_level;
     const char* icon = lvl > 85 ? LV_SYMBOL_BATTERY_FULL : lvl > 60 ? LV_SYMBOL_BATTERY_3 : lvl > 35 ? LV_SYMBOL_BATTERY_2
                      : lvl > 10 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
-    snprintf(buf, sizeof(buf), "%s%s  %d%%", g_battery_charging ? LV_SYMBOL_CHARGE "  " : "", icon, lvl);
+    snprintf(buf, sizeof(buf), "%s%s  %d%%", g_battery_external ? LV_SYMBOL_CHARGE "  " : "", icon, lvl);
   }
   // Polling presence must not redraw an unchanged header twice per second.
   if (strcmp(lv_label_get_text(lbl_batt), buf)) lv_label_set_text(lbl_batt, buf);
