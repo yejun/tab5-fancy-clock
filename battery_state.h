@@ -30,22 +30,33 @@ static int battery_percent(int pack_mv) {
   return curve[i - 1][1] + (mv - curve[i - 1][0]) * (curve[i][1] - curve[i - 1][1]) / (curve[i][0] - curve[i - 1][0]);
 }
 
+// Charge current makes the terminal voltage read high and load current low. Measured on this pack:
+// starting a 665 mA charge jumped 8083 -> 8186 mV at once and crept up ~55 mV more over 2 min;
+// stopping dropped 8241 -> 8130 mV and settled to 8095 mV over 5 min. 0.16 ohm of that is instant;
+// 0.22 ohm also covers the slower part and predicted the settled voltage within ~6 mV.
+static constexpr int PACK_R_MOHM = 220;
+static int battery_rest_mv(int pack_mv, int ma) { return pack_mv - (int)((int64_t)ma * PACK_R_MOHM / 1000); }
+
 // Hold a plugged-in pack between ~80% and ~90% to slow calendar ageing at full charge. With charging
 // disabled the Tab5 runs from USB and the pack rests (measured 0 mA). Enabling charging restarts a
-// charge cycle even when full, so only switch after the threshold has held for several samples.
+// charge cycle even when full, so decide on the estimated rest voltage (battery_rest_mv), only after
+// the threshold has held for several samples, and never switch twice within a minute.
 struct ChargeLimiter {
   static constexpr int STOP_MV = 8220, RESUME_MV = 8040;  // 2 x 4.11 V (90%), 2 x 4.02 V (80%)
   static constexpr int CONFIRM = 4;                       // consecutive samples (500 ms apart)
+  static constexpr int64_t MIN_DWELL_MS = 60000;
   bool enabled = true;
   bool charge_on = true;  // M5Unified enables charging at boot
   int above = 0, below = 0;
+  int64_t switched_at = -MIN_DWELL_MS;
   // Returns the wanted charge-enable state. Without a confirmed pack, or with the limit off, charge.
-  bool update(int pack_mv, bool pack_present) {
+  bool update(int rest_mv, bool pack_present, int64_t now) {
     if (!enabled || !pack_present) { above = below = 0; return charge_on = true; }
-    above = pack_mv >= STOP_MV ? above + 1 : 0;
-    below = pack_mv <= RESUME_MV ? below + 1 : 0;
-    if (charge_on && above >= CONFIRM) charge_on = false;
-    else if (!charge_on && below >= CONFIRM) charge_on = true;
+    above = rest_mv >= STOP_MV ? above + 1 : 0;
+    below = rest_mv <= RESUME_MV ? below + 1 : 0;
+    const bool may_switch = now - switched_at >= MIN_DWELL_MS;
+    if (charge_on && above >= CONFIRM && may_switch) { charge_on = false; switched_at = now; }
+    else if (!charge_on && below >= CONFIRM && may_switch) { charge_on = true; switched_at = now; }
     return charge_on;
   }
 };

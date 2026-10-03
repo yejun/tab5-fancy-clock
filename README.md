@@ -134,11 +134,17 @@ time in the configured timezone and rejects invalid dates and the spring DST gap
 an older in-flight NTP result. The `Z` command immediately refreshes the display in the new timezone.
 
 Charge limit (default on, toggled on the battery card's bottom row): while plugged in, charging pauses
-once the pack reaches 8.22 V (~90%) and resumes at 8.04 V (~80%), each confirmed over 2 s. With charging
-paused the Tab5 runs from USB and the pack rests at 0 mA, which slows ageing compared with sitting at
-4.2 V/cell. Re-enabling charging restarts a charge cycle even on a full pack, hence the hysteresis.
+once the pack reaches 8.22 V (~90%) and resumes at 8.04 V (~80%). Both thresholds apply to the estimated
+rest voltage, measured voltage minus current x 0.22 ohm: at 0.69 A of charge current this pack reads
+~150 mV high, so uncorrected voltages would stop charging almost as soon as it started. Each switch is
+confirmed over 2 s and at most one switch happens per minute. After a long charge the pack keeps settling
+for a while (measured: paused at an estimated 8.22 V, rested at ~8.17 V after 8 min), so in practice the
+pack sits around 80-86%. With charging paused the Tab5 runs from
+USB and the pack rests at 0 mA, which slows ageing compared with sitting at 4.2 V/cell. Re-enabling
+charging restarts a charge cycle even on a full pack, hence the hysteresis.
 Every boot starts with charging enabled (M5Unified default), so a reset falls back to normal charging.
-The battery percentage uses a typical Li-ion resting-voltage curve; it reads slightly high while charging.
+The battery percentage applies a typical Li-ion resting-voltage curve to the same rest-voltage estimate,
+so it no longer jumps when charging starts or stops.
 
 Battery Auto mode requires eight seconds of plausible pack voltage before displaying a percentage.
 The Tab5 charger can produce plausible readings with no pack, so Auto remains an estimate; select

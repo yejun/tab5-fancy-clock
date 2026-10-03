@@ -107,19 +107,37 @@ int main() {
   assert(battery_percent(6000) == 0 && battery_percent(8400) == 100 && battery_percent(9000) == 100);
   assert(battery_percent(8220) == 90 && battery_percent(8040) == 80);
   for (int mv = 6000; mv < 8500; mv += 10) assert(battery_percent(mv) <= battery_percent(mv + 10));
+  // Rest-voltage estimate against the measured trace (charge 665-692 mA, then stop).
+  assert(abs(battery_rest_mv(8241, 692) - 8095) <= 10);           // settled 5 min after stopping
+  assert(battery_rest_mv(8130, 0) == 8130 && battery_rest_mv(8000, -150) == 8033);
   ChargeLimiter limit;
-  for (int i = 0; i < 3; ++i) assert(limit.update(8230, true));   // a brief high reading does not pause
-  assert(limit.update(8100, true));                               // the confirmation count restarts
-  for (int i = 0; i < 3; ++i) assert(limit.update(8230, true));
-  assert(!limit.update(8230, true));                              // fourth consecutive sample pauses
-  for (int i = 0; i < 20; ++i) assert(!limit.update(8100, true)); // resting between 80% and 90% stays paused
-  for (int i = 0; i < 3; ++i) assert(!limit.update(8030, true));
-  assert(limit.update(8030, true));                               // confirmed drop to 80% resumes
-  for (int i = 0; i < 4; ++i) limit.update(8300, true);
+  int64_t ms = 0;
+  auto step = [&](int mv, int ma, bool present = true) { ms += 500; return limit.update(battery_rest_mv(mv, ma), present, ms); };
+  for (int i = 0; i < 3; ++i) assert(step(8230, 0));              // a brief high reading does not pause
+  assert(step(8100, 0));                                          // the confirmation count restarts
+  for (int i = 0; i < 3; ++i) assert(step(8230, 0));
+  assert(!step(8230, 0));                                         // fourth consecutive sample pauses
+  for (int i = 0; i < 20; ++i) assert(!step(8100, 0));            // resting between 80% and 90% stays paused
+  const int64_t first_pause = limit.switched_at;
+  while (ms - first_pause < ChargeLimiter::MIN_DWELL_MS - 500) assert(!step(8030, 0)); // dwell holds
+  for (int i = 0; i < 8; ++i) step(8030, 0);
+  assert(limit.charge_on);                                        // confirmed drop to 80% resumes after the dwell
+  // The jump when charging starts (rest 8040 -> 8145 mV at 665 mA, creeping up with polarisation)
+  // must not count as reaching 90%; uncorrected, 8220 mV would be crossed within minutes.
+  for (int mv = 8145; mv <= 8260; ++mv) assert(step(mv, 690));
+  for (int i = 0; i < 8; ++i) step(8380, 700);                    // really near 90% under charge current
   assert(!limit.charge_on);
-  assert(limit.update(8300, false));                              // no confirmed pack: always charge
+  // The drop when charging stops (8380 -> ~8230 mV, settling lower) must not resume charging.
+  for (int mv = 8230; mv >= 8060; --mv) assert(!step(mv, 0));
+  // Even a pathological reading cannot switch more than once a minute.
+  const int64_t paused_at = limit.switched_at;
+  while (ms - paused_at < ChargeLimiter::MIN_DWELL_MS - 500) assert(!step(7000, 0));
+  for (int i = 0; i < 8; ++i) step(7000, 0);
+  assert(limit.charge_on && limit.switched_at - paused_at >= ChargeLimiter::MIN_DWELL_MS);
+  for (int i = 0; i < 8; ++i) step(8400, 0);
+  assert(step(8400, 0, false));                                   // no confirmed pack: always charge
   limit.enabled = false;
-  for (int i = 0; i < 8; ++i) assert(limit.update(8400, true));   // limit off: charge to 100%
+  for (int i = 0; i < 8; ++i) assert(step(8400, 0));              // limit off: charge to 100%
   struct Area { int x1, y1, x2, y2; };
   Area boxes[] = {{0,0,9,9}, {0,5,9,14}, {30,30,39,39}};
   int count = 3;

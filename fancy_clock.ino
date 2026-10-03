@@ -1103,11 +1103,13 @@ static ChargeLimiter g_charge_limit;
 static bool g_charge_en = true;  // CHG_EN as last written (M5Unified enables charging at boot)
 
 static void apply_charge_limit() {
-  const bool want = g_charge_limit.update(g_battery_mv, !g_usb_only && g_battery_presence.state == BatteryPresence::Present);
+  const bool want = g_charge_limit.update(battery_rest_mv(g_battery_mv, g_battery_ma),
+                                          !g_usb_only && g_battery_presence.state == BatteryPresence::Present, mono_ms());
   if (want == g_charge_en) return;
   M5.Power.setBatteryCharge(want);
   g_charge_en = want;
-  Serial.printf("battery: charging %s at %d mV\n", want ? "resumed" : "paused", g_battery_mv);
+  Serial.printf("battery: charging %s at %d mV, %d mA (rest ~%d mV)\n", want ? "resumed" : "paused", g_battery_mv,
+                g_battery_ma, battery_rest_mv(g_battery_mv, g_battery_ma));
 }
 
 static void sample_battery() {
@@ -1116,10 +1118,10 @@ static void sample_battery() {
   if (g_usb_only) { g_battery_presence.state = BatteryPresence::Absent; apply_charge_limit(); return; }
   g_battery_mv = M5.Power.getBatteryVoltage();
   g_battery_presence.update(g_battery_mv, g_battery_sample_at);
-  apply_charge_limit();
+  if (g_battery_presence.state == BatteryPresence::Present) g_battery_ma = M5.Power.getBatteryCurrent();
+  apply_charge_limit();  // after reading the current: it corrects the voltage
   if (g_battery_presence.state == BatteryPresence::Present) {
-    g_battery_ma = M5.Power.getBatteryCurrent();
-    g_battery_level = battery_percent(g_battery_mv);
+    g_battery_level = battery_percent(battery_rest_mv(g_battery_mv, g_battery_ma));
     // CHG_STAT (what isCharging() reads) floats "charging" with USB unplugged, so use the pack current
     // instead: measured ~+680 mA charging, ~0 mA full on USB, ~-150 mA running on the battery.
     g_battery_charging = g_battery_ma > 20;
