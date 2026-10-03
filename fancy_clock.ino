@@ -1099,17 +1099,27 @@ static int g_battery_mv = 0, g_battery_ma = 0, g_battery_level = 0;
 static bool g_battery_charging = false, g_battery_external = false;
 static int64_t g_battery_sample_at = -1000;
 
+static ChargeLimiter g_charge_limit;
+static bool g_charge_en = true;  // CHG_EN as last written (M5Unified enables charging at boot)
+
+static void apply_charge_limit() {
+  const bool want = g_charge_limit.update(g_battery_mv, !g_usb_only && g_battery_presence.state == BatteryPresence::Present);
+  if (want == g_charge_en) return;
+  M5.Power.setBatteryCharge(want);
+  g_charge_en = want;
+  Serial.printf("battery: charging %s at %d mV\n", want ? "resumed" : "paused", g_battery_mv);
+}
+
 static void sample_battery() {
   if (mono_ms() - g_battery_sample_at < 500) return;
   g_battery_sample_at = mono_ms();
-  if (g_usb_only) { g_battery_presence.state = BatteryPresence::Absent; return; }
+  if (g_usb_only) { g_battery_presence.state = BatteryPresence::Absent; apply_charge_limit(); return; }
   g_battery_mv = M5.Power.getBatteryVoltage();
   g_battery_presence.update(g_battery_mv, g_battery_sample_at);
+  apply_charge_limit();
   if (g_battery_presence.state == BatteryPresence::Present) {
     g_battery_ma = M5.Power.getBatteryCurrent();
-    // Same voltage-based estimate as M5Unified, using this sample rather than
-    // a second sensor read that may disagree with the presence measurement.
-    g_battery_level = constrain((g_battery_mv / 2 - 3300) * 100 / 800, 0, 100);
+    g_battery_level = battery_percent(g_battery_mv);
     // CHG_STAT (what isCharging() reads) floats "charging" with USB unplugged, so use the pack current
     // instead: measured ~+680 mA charging, ~0 mA full on USB, ~-150 mA running on the battery.
     g_battery_charging = g_battery_ma > 20;
@@ -1484,8 +1494,8 @@ static void wifi_build() {
 // It sits clear of everything that is redrawn per frame, so while it is open it only costs its own 1 s refresh.
 // ----------------------------------------------------------------------------------------------
 static constexpr int BATT_MAH = 2000;          // the Tab5's NP-F550-type pack (2 cells in series), for the time estimate
-static constexpr int BC_W = 380, BC_H = 266, BC_X = PX + PW - BC_W, BC_Y = 74;
-static lv_obj_t *batt_ui, *batt_pct, *batt_state, *batt_bar, *batt_keys, *batt_vals, *batt_mode_lbl;
+static constexpr int BC_W = 380, BC_H = 296, BC_X = PX + PW - BC_W, BC_Y = 74;
+static lv_obj_t *batt_ui, *batt_pct, *batt_state, *batt_bar, *batt_keys, *batt_vals, *batt_mode_lbl, *batt_limit_lbl;
 static lv_timer_t* g_batt_timer = nullptr;
 static bool  g_batt_open = false;
 static float g_batt_ma = NAN;                  // smoothed current (+ = charging), for the time estimate
@@ -1493,6 +1503,7 @@ static float g_batt_ma = NAN;                  // smoothed current (+ = charging
 static void batt_refresh(lv_timer_t*) {
   const Theme& th = THEMES[g_theme];
   lv_label_set_text(batt_mode_lbl, g_usb_only ? "Battery display: USB only  (tap to change)" : "Battery display: Auto  (tap to change)");
+  lv_label_set_text(batt_limit_lbl, g_charge_limit.enabled ? "Charge limit: 80-90%  (tap to change)" : "Charge limit: Off, charge to 100%  (tap to change)");
   sample_battery();
   const int mv = g_battery_mv, lvl = g_battery_level;
   const float ma = g_battery_ma;
@@ -1513,7 +1524,8 @@ static void batt_refresh(lv_timer_t*) {
 
   snprintf(b, sizeof(b), "%d%%", lvl);
   lv_label_set_text(batt_pct, b);
-  const char* st = chg ? "Charging" : g_batt_ma > -30 ? (lvl >= 95 ? "Full" : "Not charging") : "On battery";
+  const char* st = chg ? "Charging" : g_battery_external ? (!g_charge_en ? "Resting at limit" : lvl >= 95 ? "Full" : "Not charging")
+                 : "On battery";
   lv_label_set_text(batt_state, st);
   lv_obj_set_style_text_color(batt_state, lv_color_hex(chg ? th.acc1 : th.ink), 0);
   lv_bar_set_value(batt_bar, lvl, LV_ANIM_OFF);
@@ -1522,7 +1534,7 @@ static void batt_refresh(lv_timer_t*) {
   // Rough time estimate from the level and the smoothed current (charging tapers off near full, so it is optimistic)
   float hours = -1;
   if (chg && g_batt_ma > 50) hours = (100 - lvl) / 100.0f * BATT_MAH / g_batt_ma;
-  else if (!chg && g_batt_ma < -30) hours = lvl / 100.0f * BATT_MAH / -g_batt_ma;
+  else if (!g_battery_external && g_batt_ma < -30) hours = lvl / 100.0f * BATT_MAH / -g_batt_ma;
   char est[32] = "-";
   if (hours >= 0) {
     const int m = (int)(hours * 60 + 0.5f);
@@ -1555,6 +1567,7 @@ static void batt_build() {
   batt_keys = mk_label(batt_ui, f_small, 0xFFFFFF, 150, "", 24, 96, 140);
   batt_vals = mk_label(batt_ui, f_small, 0xFFFFFF, 235, "", 120, 96, BC_W - 144, LV_TEXT_ALIGN_RIGHT);
   batt_mode_lbl = mk_label(batt_ui, f_tiny, 0xFFFFFF, 180, "", 24, 234, BC_W - 48, LV_TEXT_ALIGN_CENTER);
+  batt_limit_lbl = mk_label(batt_ui, f_tiny, 0xFFFFFF, 180, "", 24, 264, BC_W - 48, LV_TEXT_ALIGN_CENTER);
   g_batt_timer = lv_timer_create(batt_refresh, 1000, nullptr);
   lv_timer_pause(g_batt_timer);
 }
@@ -1580,6 +1593,13 @@ static void set_battery_mode(bool usb_only) {
   g_battery_presence = BatteryPresence();
   g_battery_sample_at = -1000;
   update_battery();
+  if (g_batt_open) batt_refresh(nullptr);
+}
+
+static void set_charge_limit(bool on) {
+  g_charge_limit.enabled = on;
+  prefs.putBool("chg_lim", on);
+  apply_charge_limit();
   if (g_batt_open) batt_refresh(nullptr);
 }
 
@@ -1747,8 +1767,10 @@ static void touch_read_cb(lv_indev_t*, lv_indev_data_t* d) {
 // A confirmed single tap on the clock face.
 static void run_tap(int x, int y) {
   if (g_batt_open) {
-    if (x >= BC_X && x < BC_X + BC_W && y >= BC_Y + 220 && y < BC_Y + BC_H)
+    if (x >= BC_X && x < BC_X + BC_W && y >= BC_Y + 220 && y < BC_Y + 252)
       set_battery_mode(!g_usb_only);
+    else if (x >= BC_X && x < BC_X + BC_W && y >= BC_Y + 252 && y < BC_Y + BC_H)
+      set_charge_limit(!g_charge_limit.enabled);
     else batt_close();
   } else if (x >= PX + PW - 128 && y < 90) {        // battery icon (top right)
     batt_open();
@@ -1840,6 +1862,7 @@ void setup() {
   g_theme = prefs.getInt("theme", 0) % N_THEMES;
   g_24h = prefs.getBool("h24", true);
   g_usb_only = prefs.getBool("batt_usb", false);
+  g_charge_limit.enabled = prefs.getBool("chg_lim", true);
   g_bri = (uint8_t)constrain((int)prefs.getUChar("bri", BRIGHTNESS), MIN_BRIGHTNESS, 255);
   M5.Display.setBrightness(g_bri);
 

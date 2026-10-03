@@ -162,8 +162,10 @@ static void handle_serial() {
         Serial.printf("ui time=%s | date=%s | month=%s\n", lv_label_get_text(lbl_time), lv_label_get_text(lbl_date), lv_label_get_text(lbl_month));
         Serial.printf("uptime_ms=%lld reset_reason=%d rtc_ready=%d rtc_lost=%d battery_presence=%d usb_only=%d\n", (long long)mono_ms(),
                       (int)esp_reset_reason(), (int)g_rtc_ready, [] { bool l = false; return rtc_time_lost(l) ? (int)l : -1; }(), (int)g_battery_presence.state, (int)g_usb_only);
-        Serial.printf("battery: level=%d voltage=%dmV current=%dmA charging=%d external=%d chg_stat=%d\n", g_battery_level,
-                      g_battery_mv, g_battery_ma, (int)g_battery_charging, (int)g_battery_external, (int)M5.Power.isCharging());
+        Serial.printf("battery: level=%d voltage=%dmV current=%dmA charging=%d external=%d chg_stat=%d charge_limit=%d charge_en=%d chg_en_out=%d chg_en_in=%d\n",
+                      g_battery_level, g_battery_mv, g_battery_ma, (int)g_battery_charging, (int)g_battery_external,
+                      (int)M5.Power.isCharging(), (int)g_charge_limit.enabled, (int)g_charge_en,
+                      (int)M5.getIOExpander(1).getWriteValue(7), (int)M5.getIOExpander(1).digitalRead(7));
         Serial.printf("heap int=%u psram=%u | flushes=%u avg=%uus/flush %uus/kpx\n",
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)g_flush_n,
@@ -212,6 +214,12 @@ static void handle_serial() {
         else if (!strcmp(line + 1, " auto")) set_battery_mode(false);
         else { Serial.println("ERR usage: V usb|auto"); break; }
         Serial.printf("OK battery display %s\n", g_usb_only ? "USB only" : "Auto");
+        break;
+      case 'L':
+        if (!strcmp(line + 1, " on")) set_charge_limit(true);
+        else if (!strcmp(line + 1, " off")) set_charge_limit(false);
+        else { Serial.println("ERR usage: L on|off"); break; }
+        Serial.printf("OK charge limit %s\n", g_charge_limit.enabled ? "80-90%" : "off");
         break;
       case 'G': if (g_batt_open) batt_close(); else batt_open(); Serial.printf("OK battery card %s\n", g_batt_open ? "open" : "closed"); break;
       default: Serial.println("ERR unknown command"); break;

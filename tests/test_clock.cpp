@@ -104,6 +104,22 @@ int main() {
   assert(battery.state == BatteryPresence::Present); // stable inserted pack
   battery.update(4250, 39500);
   assert(battery.state == BatteryPresence::Absent); // pack removed
+  assert(battery_percent(6000) == 0 && battery_percent(8400) == 100 && battery_percent(9000) == 100);
+  assert(battery_percent(8220) == 90 && battery_percent(8040) == 80);
+  for (int mv = 6000; mv < 8500; mv += 10) assert(battery_percent(mv) <= battery_percent(mv + 10));
+  ChargeLimiter limit;
+  for (int i = 0; i < 3; ++i) assert(limit.update(8230, true));   // a brief high reading does not pause
+  assert(limit.update(8100, true));                               // the confirmation count restarts
+  for (int i = 0; i < 3; ++i) assert(limit.update(8230, true));
+  assert(!limit.update(8230, true));                              // fourth consecutive sample pauses
+  for (int i = 0; i < 20; ++i) assert(!limit.update(8100, true)); // resting between 80% and 90% stays paused
+  for (int i = 0; i < 3; ++i) assert(!limit.update(8030, true));
+  assert(limit.update(8030, true));                               // confirmed drop to 80% resumes
+  for (int i = 0; i < 4; ++i) limit.update(8300, true);
+  assert(!limit.charge_on);
+  assert(limit.update(8300, false));                              // no confirmed pack: always charge
+  limit.enabled = false;
+  for (int i = 0; i < 8; ++i) assert(limit.update(8400, true));   // limit off: charge to 100%
   struct Area { int x1, y1, x2, y2; };
   Area boxes[] = {{0,0,9,9}, {0,5,9,14}, {30,30,39,39}};
   int count = 3;

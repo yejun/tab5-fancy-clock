@@ -88,6 +88,7 @@ POSIX TZ examples: `EST5EDT,M3.2.0,M11.1.0` (US Eastern), `GMT0BST,M3.5.0/1,M10.
     tools/clockctl.py cmd A          # accelerometer reading and the orientation it asks for
     tools/clockctl.py cmd G          # open/close the battery card
     tools/clockctl.py cmd "V usb"    # saved USB-only display (no battery fitted); "V auto" restores detection
+    tools/clockctl.py cmd "L off"    # charge limit off (charge to 100%); "L on" holds the pack at 80-90%
     tools/clockctl.py cmd K          # stress test: 20 automatic theme switches
     tools/clockctl.py cmd H<mask>    # debug: 1=hide day ring 2=hand shadows 4=soft shadow penumbra 8=region merging
     tools/clockctl.py log 5          # device log
@@ -131,6 +132,13 @@ and RTC retention across a real power cycle still need hands-on checks.
 Raw time commands: `E <UTC epoch seconds>` sets UTC directly; `T YYYY-MM-DD HH:MM:SS` interprets local
 time in the configured timezone and rejects invalid dates and the spring DST gap. Either invalidates
 an older in-flight NTP result. The `Z` command immediately refreshes the display in the new timezone.
+
+Charge limit (default on, toggled on the battery card's bottom row): while plugged in, charging pauses
+once the pack reaches 8.22 V (~90%) and resumes at 8.04 V (~80%), each confirmed over 2 s. With charging
+paused the Tab5 runs from USB and the pack rests at 0 mA, which slows ageing compared with sitting at
+4.2 V/cell. Re-enabling charging restarts a charge cycle even on a full pack, hence the hysteresis.
+Every boot starts with charging enabled (M5Unified default), so a reset falls back to normal charging.
+The battery percentage uses a typical Li-ion resting-voltage curve; it reads slightly high while charging.
 
 Battery Auto mode requires eight seconds of plausible pack voltage before displaying a percentage.
 The Tab5 charger can produce plausible readings with no pack, so Auto remains an estimate; select
