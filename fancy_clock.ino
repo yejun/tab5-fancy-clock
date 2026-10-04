@@ -219,6 +219,9 @@ static lv_font_t *f_digits, *f_sec, *f_date, *f_head, *f_num, *f_cal, *f_small, 
 
 // Objects that need re-colouring when the theme changes
 static lv_obj_t *bg_img, *dial_obj, *secbar_obj, *lbl_greet, *lbl_time, *lbl_ampm, *lbl_sec, *lbl_date;
+static lv_obj_t* lbl_slot[5];
+static int g_slot_x[5], g_slot_w[5];
+static constexpr int TIME_X = PX - 6, TIME_Y = 36;   // the big time: digit slots (see layout_time)
 static lv_obj_t *lbl_wifi, *lbl_batt, *lbl_month, *today_mark, *week_mark;
 static lv_obj_t *lbl_wd[7], *lbl_day[42];
 
@@ -1044,6 +1047,7 @@ static void apply_dynamic_theme() {
   set_grad(&g_grad_bar, 2, c, o, LV_GRAD_DIR_HOR);
   lv_obj_set_style_text_color(lbl_greet, lv_color_hex(th.acc1), 0);
   lv_obj_set_style_text_color(lbl_time, lv_color_hex(th.ink), 0);
+  for (lv_obj_t* l : lbl_slot) lv_obj_set_style_text_color(l, lv_color_hex(th.ink), 0);
   lv_obj_set_style_text_color(lbl_date, lv_color_hex(th.ink), 0);
   lv_obj_set_style_text_color(lbl_batt, lv_color_hex(th.ink), 0);
   lv_obj_set_style_text_color(lbl_wifi, lv_color_hex(ntp_active() ? th.acc1 : th.ink), 0);
@@ -1057,6 +1061,26 @@ static void apply_dynamic_theme() {
     const bool we = c == 0 || c == 6;
     lv_obj_set_style_text_color(lbl_wd[c], lv_color_hex(we ? th.acc2 : th.ink), 0);
   }
+}
+
+// The big time: four equal digit slots and a colon slot (tabular figures), so the digits never shift as the time
+// changes, and the split-flap show's cards sit exactly on them. lbl_time stays as the (hidden) text of the time.
+
+static void layout_time() {
+  int dmax = 0;
+  for (char c = '0'; c <= '9'; c++) dmax = max(dmax, (int)lv_font_get_glyph_width(f_digits, c, 0));
+  const int colon = (int)lv_font_get_glyph_width(f_digits, ':', 0) + 10;
+  const int right = g_24h ? SCR_W - 8 : PX + PW - 64;   // 12-hour: AM/PM goes to the right of the digits
+  const int pitch = min(dmax + 20, (right - TIME_X - colon) / 4);
+  int x = TIME_X;
+  for (int i = 0; i < 5; i++) {
+    g_slot_x[i] = x;
+    g_slot_w[i] = i == 2 ? colon : pitch;
+    lv_obj_set_pos(lbl_slot[i], x, TIME_Y);
+    lv_obj_set_width(lbl_slot[i], g_slot_w[i]);
+    x += g_slot_w[i];
+  }
+  lv_obj_set_pos(lbl_ampm, x + 4, 104);
 }
 
 static void build_dynamic_ui() {
@@ -1086,7 +1110,9 @@ static void build_dynamic_ui() {
   lbl_batt = mk_label(scr, &lv_font_montserrat_20, 0xFFFFFF, 190, "", PX + PW - 190, 36, 180, LV_TEXT_ALIGN_RIGHT);
   lbl_wifi = mk_label(scr, &lv_font_montserrat_20, 0xFFFFFF, LV_OPA_30, LV_SYMBOL_WIFI, PX + PW - 170, 36, 40);
 
-  lbl_time = mk_label(scr, f_digits, 0xFFFFFF, LV_OPA_COVER, "00:00", PX - 6, 36, 470);
+  lbl_time = mk_label(scr, f_digits, 0xFFFFFF, LV_OPA_COVER, "00:00", TIME_X, TIME_Y, 470);
+  lv_obj_add_flag(lbl_time, LV_OBJ_FLAG_HIDDEN);       // the text model; the slots below show it
+  for (int i = 0; i < 5; i++) lbl_slot[i] = mk_label(scr, f_digits, 0xFFFFFF, LV_OPA_COVER, "", TIME_X, TIME_Y, 100, LV_TEXT_ALIGN_CENTER);
   lbl_ampm = mk_label(scr, f_sec, 0xFFFFFF, LV_OPA_COVER, "", PX + PW - 60, 104, 70);
   lbl_date = mk_label(scr, f_date, 0xFFFFFF, 235, "", PX + 4, 252, PW);
   lbl_sec = mk_label(scr, f_small, 0xFFFFFF, LV_OPA_COVER, "", PX + PW - 90, 322, 90, LV_TEXT_ALIGN_RIGHT);
@@ -1180,6 +1206,13 @@ static void update_minute(const Now& n, bool force) {
     lv_obj_remove_flag(lbl_ampm, LV_OBJ_FLAG_HIDDEN);
   }
   lv_label_set_text(lbl_time, buf);
+  static int laid_out = -1;                       // re-lay the slots when 12/24-hour changes
+  if (laid_out != (int)g_24h) { laid_out = g_24h; layout_time(); }
+  const int pad = 5 - (int)strlen(buf);           // right-aligned: a 12-hour "9:41" leaves the first slot blank
+  for (int i = 0; i < 5; i++) {
+    const char t[2] = {i >= pad ? buf[i - pad] : 0, 0};
+    if (strcmp(lv_label_get_text(lbl_slot[i]), t)) lv_label_set_text(lbl_slot[i], t);
+  }
   set_day_ring(n.h * 60 + n.mi, force);
 
   const char* g = n.h < 5 ? "GOOD NIGHT" : n.h < 12 ? "GOOD MORNING" : n.h < 18 ? "GOOD AFTERNOON" : "GOOD EVENING";

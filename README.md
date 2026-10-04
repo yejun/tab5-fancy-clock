@@ -10,8 +10,8 @@ The Python device tools require `pyserial`; saving PNG screenshots also requires
 With [mise](https://mise.jdx.dev), `mise trust && mise run setup` creates and activates `.venv` in this directory;
 then `mise run test | flash | device-test`. Without mise: `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`.
 
-- Analog dial with sweeping second hand (~15 fps), day-progress ring, frosted-glass calendar card, big digital time,
-  seconds bar, battery.
+- Analog dial with sweeping second hand (~15 fps), day-progress ring, frosted-glass calendar card, big digital time
+  (fixed digit slots, so the digits never shift as the time changes), seconds bar, battery.
 - Five themes (Aurora, Sunset, Ocean, Jade, Graphite): deep tinted backgrounds, saturated-but-soft accents, off-white
   "ink" instead of pure white. Fine detail: guilloche sub-dial, sunburst, railway minute track, applied indices with a
   lit edge, translucent lens on the second-hand tip, aurora ribbons and bokeh behind a blurred glass card.
@@ -41,7 +41,7 @@ hand holds still while one runs; a tap ends it. Measured on the device while ani
 | `sweep` | a sheen crosses the calendar card, a glint with a tail runs round the bezel | 25-27 | 61 ms |
 | `fireworks` | rockets burst into streaking sparks over the dial | 21-23 | 78 ms |
 | `numerals` | the numerals lift off, orbit on a tilted ring in perspective and land again | 15-16 | 93 ms |
-| `flap` | the big digits become a split-flap board and cascade to the time | 28 | 56 ms |
+| `flap` | flip-board cards fade in under the digits, which cascade through random digits to the time | 28-29 | 168 ms |
 | `dialflip` | the dial turns over in 3D to a back face with the time and date, and back | 23 | 63 ms |
 | `aurora` | a curtain of light ripples across the top of the screen | 17 | 62 ms |
 

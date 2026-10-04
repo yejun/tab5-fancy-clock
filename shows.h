@@ -585,20 +585,24 @@ static void numerals_end() {
 }
 
 // ----------------------------------------------------------------------------------------------
-// 4. Split-flap: the big digits become a departure board. Every digit column flips through a few random digits
-// before landing on the time (later columns flip longer, so it settles left to right). Each flip folds the old top
-// half down and unfolds the new bottom half around the digits' midline, darkening the moving leaf.
+// 4. Split-flap: the big digits become a departure board. Cards fade in under the clock's fixed digit slots (rounded,
+// shaded upper and lower flaps, a lit top edge, a hinge with side pins, a soft shadow), every digit flips through a
+// few random digits before landing on the time - later columns flip longer, so it settles left to right.
+// Each flip folds the old upper flap down and unfolds the new lower flap around the hinge, darkening the moving leaf.
 // ----------------------------------------------------------------------------------------------
 static lv_draw_buf_t* g_glyph[11];                 // '0'..'9', ':'
 static char g_flap_text[8];
 static int g_flap_n = 0;
-struct FlapCol { float cx; int flips; char seq[12]; float t0; int x1, x2; };
+struct FlapCol { float cx; int x1, x2; bool card; int flips; char seq[12]; float t0; };   // slot centre, card extent
 static FlapCol g_flap[8];
-static int g_flap_y = 0, g_flap_mid = 0, g_flap_h = 0, g_flap_wmax = 0;
-static int g_flap_top = 0, g_flap_bot = 0;          // digit ink extent within a glyph sprite
-static constexpr float FLAP_T = 4.2f;
+static int g_flap_y = 0, g_flap_mid = 0, g_flap_h = 0;
+static int g_flap_top = 0, g_flap_bot = 0;         // digit ink extent within a glyph sprite
+static int g_card_w = 0;                           // every card has the same size
+static float g_flap_m = 0;                         // 0 = digits at their natural places, 1 = on the cards
+static constexpr float FLAP_T = 4.6f;
 static lv_area_t g_flap_box;
 static constexpr float FLAP_DT = 0.20f;            // one flip
+static constexpr int CARD_R = 14, CARD_PAD = 15;
 
 static inline int glyph_idx(char c) { return c == ':' ? 10 : c >= '0' && c <= '9' ? c - '0' : -1; }
 static bool g_flap_ok = false;
@@ -622,84 +626,109 @@ static void flap_begin() {
   lv_obj_delete(scr);
   g_flap_ok = true;
   for (int i = 0; i < 11; i++) if (!g_glyph[i]) g_flap_ok = false;
-  Serial.printf("flap: glyphs %s, text '%s'\n", g_flap_ok ? "ok" : "MISSING", lv_label_get_text(lbl_time));
-  if (!g_flap_ok) return;
-  // the digits' visual midline (the hinge) from the alpha of '0'
+  if (!g_flap_ok) { Serial.println("flap: glyph snapshot failed"); return; }
+  // the hinge sits at the middle of the digits' ink (from '0')
   int top = -1, bot = -1;
   const lv_draw_buf_t* z = g_glyph[0];
-  for (int y = 0; y < (int)z->header.h; y++)
+  auto row_inked = [z](int y) {
     for (int x = 0; x < (int)z->header.w; x++)
-      if (((const uint8_t*)z->data)[y * z->header.stride + x * 4 + 3] > 128) { if (top < 0) top = y; bot = y; break; }
+      if (((const uint8_t*)z->data)[y * z->header.stride + x * 4 + 3] > 96) return true;
+    return false;
+  };
+  for (int y = 0; y < (int)z->header.h; y++) if (row_inked(y)) { top = y; break; }
+  for (int y = (int)z->header.h - 1; y >= 0; y--) if (row_inked(y)) { bot = y; break; }
   g_flap_h = z->header.h;
-  g_flap_mid = top >= 0 ? (top + bot) / 2 : g_flap_h / 2;
+  g_flap_mid = top >= 0 && bot >= 0 ? (top + bot) / 2 : g_flap_h / 2;
   g_flap_top = top >= 0 ? top : 0;
   g_flap_bot = bot >= 0 ? bot : g_flap_h - 1;
-  g_flap_wmax = 0;
-  for (int i = 0; i < 10; i++) g_flap_wmax = max(g_flap_wmax, (int)g_glyph[i]->header.w);
-  // the final text and where each character sits in the label
-  lv_obj_update_layout(lbl_time);
-  strlcpy(g_flap_text, lv_label_get_text(lbl_time), sizeof(g_flap_text));
-  g_flap_n = strlen(g_flap_text);
-  lv_area_t la;
-  lv_obj_get_coords(lbl_time, &la);
-  g_flap_y = la.y1 - ext;
-  float t0 = 0.15f;
-  for (int i = 0; i < g_flap_n; i++) {
-    lv_point_t pt;
-    lv_label_get_letter_pos(lbl_time, i, &pt);
-    const char c = g_flap_text[i];
+  // the board is the clock's own time layout: one card per digit slot (blank ones too), the colon slot bare.
+  // A glyph sprite centred on its slot lands exactly where the slot label draws it.
+  g_flap_y = TIME_Y - ext;
+  g_flap_n = 5;
+  float t0 = 0.30f;
+  int k = 0;
+  for (int i = 0; i < 5; i++) {
     FlapCol& col = g_flap[i];
-    const int gi = glyph_idx(c);
-    col.cx = la.x1 + pt.x + (gi >= 0 ? g_glyph[gi]->header.w : 0) / 2.0f;
-    col.flips = gi >= 0 && gi < 10 ? 4 + 2 * i : 0;
+    const char c = lv_label_get_text(lbl_slot[i])[0];
+    col.cx = g_slot_x[i] + g_slot_w[i] / 2.0f;
+    col.x1 = g_slot_x[i] + 4;
+    col.x2 = g_slot_x[i] + g_slot_w[i] - 6;
+    col.card = i != 2;
+    const bool digit = c >= '0' && c <= '9';
+    col.flips = digit ? 4 + 2 * k : 0;
     for (int f = 0; f < col.flips; f++) col.seq[f] = '0' + esp_random() % 10;
-    col.seq[col.flips] = c;
+    col.seq[col.flips] = c ? c : ' ';
     col.t0 = t0;
-    t0 += 0.10f;
+    if (digit) { t0 += 0.10f; k++; }
   }
-  for (int i = 0; i < g_flap_n; i++) {   // each card reaches halfway to its neighbours, less a gap
-    FlapCol& c = g_flap[i];
-    const float l = i > 0 ? (g_flap[i - 1].cx + c.cx) / 2 : c.cx - g_flap_wmax / 2 - 10;
-    const float r = i + 1 < g_flap_n ? (g_flap[i + 1].cx + c.cx) / 2 : c.cx + g_flap_wmax / 2 + 10;
-    c.x1 = (int)(fmaxf(l, c.cx - g_flap_wmax / 2 - 10) + 4);
-    c.x2 = (int)(fminf(r, c.cx + g_flap_wmax / 2 + 10) - 4);
-  }
-  g_flap_box = {(int32_t)la.x1 - 24, (int32_t)la.y1, (int32_t)la.x2 + 24, (int32_t)la.y1 + g_flap_h + 20};
-  lv_obj_add_flag(lbl_time, LV_OBJ_FLAG_HIDDEN);
+  g_card_w = g_slot_w[0] - 10;
+  g_flap_box = {(int32_t)g_slot_x[0] - 12, (int32_t)(g_flap_y + g_flap_top - CARD_PAD - 4),
+                (int32_t)(g_slot_x[4] + g_slot_w[4] + 12), (int32_t)(g_flap_y + g_flap_bot + CARD_PAD + 14)};
+  g_flap_box.y1 = min(g_flap_box.y1, (int32_t)TIME_Y);
+  g_flap_m = 0;
+  for (lv_obj_t* l : lbl_slot) lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
 }
 
 static float g_flap_t = 0;
-static void flap_tick(float t) { if (g_flap_ok) { g_flap_t = t; lv_inv_area(g_disp, &g_flap_box); } }
+static void flap_tick(float t) {
+  if (!g_flap_ok) return;
+  g_flap_t = t;
+  g_flap_m = ease(t / 0.3f) * (1 - ease((t - (FLAP_T - 0.5f)) / 0.45f));   // the cards fade in and out
+  lv_inv_area(g_disp, &g_flap_box);
+}
 
+static lv_color_t shade_to(lv_color_t c, lv_opa_t shade) { return lv_color_mix(lv_color_black(), c, shade); }
 
-// One half (or folding leaf) of a flap: an opaque card piece with the glyph on it. `half`: the card half it belongs
-// to; `s`: how far the leaf is open (1 = flat); the leaf is squeezed towards the hinge.
-static void flap_piece(lv_layer_t* L, char c, const FlapCol& col, bool top_half, float s, lv_opa_t shade, lv_opa_t card_opa) {
+// One flap of a card - its upper or lower half, or the moving leaf - with the glyph half on it. `s`: how far the
+// leaf is open (1 = flat), squeezed towards the hinge; `shade` darkens it as it turns away.
+static void flap_piece(lv_layer_t* L, char c, const FlapCol& col, bool upper, float s, lv_opa_t shade, lv_opa_t card) {
   const Theme& th = THEMES[g_theme];
   const int ym = g_flap_y + g_flap_mid;
-  const float cx = col.cx;
   const int x1 = col.x1, x2 = col.x2;
-  const int cy1 = g_flap_y + g_flap_top - 16, cy2 = g_flap_y + g_flap_bot + 16;
-  lv_area_t piece = top_half ? lv_area_t{x1, (int32_t)lroundf(ym - (ym - cy1) * s), x2, ym - 1}
-                             : lv_area_t{x1, ym + 1, x2, (int32_t)lroundf(ym + 1 + (cy2 - ym - 1) * s)};
+  const int cy1 = g_flap_y + g_flap_top - CARD_PAD, cy2 = g_flap_y + g_flap_bot + CARD_PAD;
+  const bool is_card = col.card && card;
+  lv_area_t piece = upper ? lv_area_t{x1, (int32_t)lroundf(ym - (ym - cy1) * s), x2, ym - 2}
+                          : lv_area_t{x1, ym + 2, x2, (int32_t)lroundf(ym + 2 + (cy2 - ym - 2) * s)};
+  if (!is_card) { piece.x1 -= 40; piece.x2 += 40; }   // the colon and the glyphs while the cards are hidden
   if (piece.y2 < piece.y1) return;
   lv_area_t cl;
   if (!area_clip(cl, L->_clip_area, piece)) return;
   const lv_area_t saved = L->_clip_area;
   L->_clip_area = cl;
-  if (card_opa) {
+  if (is_card) {
+    // body: a lighter upper flap, a darker lower one; the gradient follows a moving leaf as it squeezes
+    const lv_color_t base = lv_color_mix(lv_color_black(), lv_color_mix(lv_color_hex(th.acc3), lv_color_hex(th.bg_top), 50), 100);
+    const lv_color_t light = lv_color_mix(lv_color_hex(th.ink), base, 40);
+    const lv_color_t dark = lv_color_mix(lv_color_black(), base, 75);
     lv_draw_rect_dsc_t r;
     lv_draw_rect_dsc_init(&r);
-    r.radius = 12;
-    r.bg_color = lv_color_mix(lv_color_black(), lv_color_hex(th.bg_top), 150 + shade / 3);
-    r.bg_opa = card_opa;
-    const lv_area_t card = {x1, cy1, x2, cy2};      // full card, clipped to this piece (rounded corners stay right)
-    const lv_area_t leaf = top_half ? lv_area_t{x1, piece.y1, x2, ym + 12} : lv_area_t{x1, ym - 12, x2, piece.y2};
-    lv_draw_rect(L, &r, s >= 0.995f ? &card : &leaf);
+    r.radius = CARD_R;
+    r.bg_opa = card;
+    r.bg_color = shade_to(upper ? light : base, shade);
+    r.bg_grad.dir = LV_GRAD_DIR_VER;
+    r.bg_grad.stops_count = 2;
+    r.bg_grad.stops[0].color = shade_to(upper ? light : base, shade);
+    r.bg_grad.stops[1].color = shade_to(upper ? base : dark, shade);
+    r.bg_grad.stops[0].opa = r.bg_grad.stops[1].opa = card;
+    r.bg_grad.stops[0].frac = 0;
+    r.bg_grad.stops[1].frac = 255;
+    r.border_width = 1;
+    r.border_color = lv_color_black();
+    r.border_opa = (lv_opa_t)(card * 140 / 255);
+    // a whole rounded card per flap, clipped to the flap: rounded outer corners, square at the hinge
+    const lv_area_t body = upper ? lv_area_t{x1, piece.y1, x2, ym + CARD_R} : lv_area_t{x1, ym - CARD_R, x2, piece.y2};
+    lv_draw_rect(L, &r, &body);
+    if (upper && s >= 0.995f) {        // the lit top edge
+      lv_draw_rect_dsc_t e;
+      lv_draw_rect_dsc_init(&e);
+      e.bg_color = lv_color_hex(th.ink);
+      e.bg_opa = (lv_opa_t)(card * 60 / 255);
+      const lv_area_t edge = {x1 + CARD_R, cy1 + 1, x2 - CARD_R, cy1 + 1};
+      lv_draw_rect(L, &e, &edge);
+    }
   }
   const int gi = glyph_idx(c);
-  const lv_draw_buf_t* b = gi >= 0 ? g_glyph[gi] : nullptr;
-  if (b) {
+  if (const lv_draw_buf_t* b = gi >= 0 ? g_glyph[gi] : nullptr) {
     lv_draw_image_dsc_t d;
     lv_draw_image_dsc_init(&d);
     d.src = b;
@@ -708,56 +737,72 @@ static void flap_piece(lv_layer_t* L, char c, const FlapCol& col, bool top_half,
     d.pivot.y = g_flap_mid;
     d.recolor = lv_color_black();
     d.recolor_opa = shade;
-    const int x = (int)lroundf(cx - b->header.w / 2.0f);
+    const int x = (int)lroundf(col.cx - b->header.w / 2.0f);
     const lv_area_t a = {x, g_flap_y, x + (int32_t)b->header.w - 1, g_flap_y + (int32_t)b->header.h - 1};
     lv_draw_image(L, &d, &a);
   }
   L->_clip_area = saved;
 }
 
+static void flap_card_frame(lv_layer_t* L, const FlapCol& col, lv_opa_t card, bool shadow) {
+  const int ym = g_flap_y + g_flap_mid;
+  const int x1 = col.x1, x2 = col.x2;
+  const int cy1 = g_flap_y + g_flap_top - CARD_PAD, cy2 = g_flap_y + g_flap_bot + CARD_PAD;
+  lv_draw_rect_dsc_t r;
+  lv_draw_rect_dsc_init(&r);
+  if (shadow) {                        // a soft shadow under the card: stacked translucent rounded rects
+    r.bg_color = lv_color_black();
+    for (int k = 0; k < 3; k++) {
+      r.radius = CARD_R + 2 + 2 * k;
+      r.bg_opa = (lv_opa_t)(card * (36 - 10 * k) / 255);
+      const lv_area_t a = {x1 - 1 - 2 * k, cy1 + 5 - k, x2 + 1 + 2 * k, cy2 + 7 + 2 * k};
+      lv_draw_rect(L, &r, &a);
+    }
+    return;
+  }
+  // the hinge: a dark split, a lit bevel under it, a pin at each side
+  r.bg_color = lv_color_black();
+  r.bg_opa = (lv_opa_t)(card * 230 / 255);
+  const lv_area_t split = {x1, ym - 1, x2, ym + 1};
+  lv_draw_rect(L, &r, &split);
+  r.bg_color = lv_color_hex(THEMES[g_theme].ink);
+  r.bg_opa = (lv_opa_t)(card * 28 / 255);
+  const lv_area_t bevel = {x1 + 2, ym + 2, x2 - 2, ym + 2};
+  lv_draw_rect(L, &r, &bevel);
+  r.bg_color = lv_color_mix(lv_color_hex(THEMES[g_theme].ink), lv_color_black(), 70);
+  r.bg_opa = card;
+  r.radius = 2;
+  const lv_area_t pin_l = {x1 - 3, ym - 6, x1 + 2, ym + 6}, pin_r = {x2 - 2, ym - 6, x2 + 3, ym + 6};
+  lv_draw_rect(L, &r, &pin_l);
+  lv_draw_rect(L, &r, &pin_r);
+}
+
 static void flap_draw(lv_layer_t* L) {
   if (!g_flap_ok || !clip_hit_xy(L, g_flap_box.x1, g_flap_box.y1, g_flap_box.x2, g_flap_box.y2)) return;
-  const float T = FLAP_T;
-  // opaque cards (a translucent leaf would show the digit behind it); they fade in before the first flip
-  const lv_opa_t card = (lv_opa_t)(255 * ease(g_flap_t / 0.14f) * (1 - ease((g_flap_t - (T - 0.6f)) / 0.5f)));
-  const int ym = g_flap_y + g_flap_mid;
+  const lv_opa_t card = (lv_opa_t)(255 * g_flap_m);
+  if (card) for (int i = 0; i < g_flap_n; i++) if (g_flap[i].card) flap_card_frame(L, g_flap[i], card, true);
   for (int i = 0; i < g_flap_n; i++) {
     const FlapCol& c = g_flap[i];
-    if (!c.flips) {                                       // the colon: no card
-      flap_piece(L, c.seq[0], c, true, 1, 0, 0);
-      flap_piece(L, c.seq[0], c, false, 1, 0, 0);
-      continue;
-    }
     const float u = (g_flap_t - c.t0) / FLAP_DT;
     const int k = u < 0 ? -1 : (int)u;                    // flip in progress: seq[k] -> seq[k+1]
-    if (k < 0 || k >= c.flips) {
-      const char ch = c.seq[k < 0 ? 0 : c.flips];
+    if (!c.flips || k < 0 || k >= c.flips) {
+      const char ch = c.seq[k < 0 || !c.flips ? 0 : c.flips];
       flap_piece(L, ch, c, true, 1, 0, card);
       flap_piece(L, ch, c, false, 1, 0, card);
-      continue;
+    } else {
+      const char a = c.seq[k], b = c.seq[k + 1];
+      const float p = u - k;
+      flap_piece(L, b, c, true, 1, 0, card);              // behind the leaf: the next upper flap ...
+      flap_piece(L, a, c, false, 1, 0, card);             // ... and the current lower one
+      if (p < 0.5f) flap_piece(L, a, c, true, cosf(p * (float)M_PI), (lv_opa_t)(200 * p * 2), card);     // old upper falls
+      else          flap_piece(L, b, c, false, -cosf(p * (float)M_PI), (lv_opa_t)(150 * (1 - p) * 2), card); // new lower lands
     }
-    const char a = c.seq[k], b = c.seq[k + 1];
-    const float p = u - k;
-    flap_piece(L, b, c, true, 1, 0, card);             // behind the leaf: the next top half ...
-    flap_piece(L, a, c, false, 1, 0, card);            // ... and the current bottom half
-    if (p < 0.5f) flap_piece(L, a, c, true, cosf(p * (float)M_PI), (lv_opa_t)(220 * p), card);        // old top falls
-    else          flap_piece(L, b, c, false, -cosf(p * (float)M_PI), (lv_opa_t)(220 * (1 - p)), card); // new bottom lands
-  }
-  if (card) {                                             // the hinge: a dark seam across each card
-    lv_draw_rect_dsc_t r;
-    lv_draw_rect_dsc_init(&r);
-    r.bg_color = lv_color_black();
-    r.bg_opa = (lv_opa_t)(card * 200 / 255);
-    for (int i = 0; i < g_flap_n; i++) {
-      if (!g_flap[i].flips) continue;
-      const lv_area_t h = {g_flap[i].x1, ym - 1, g_flap[i].x2, ym + 1};
-      lv_draw_rect(L, &r, &h);
-    }
+    if (card && c.card) flap_card_frame(L, c, card, false);
   }
 }
 
 static void flap_end() {
-  lv_obj_remove_flag(lbl_time, LV_OBJ_FLAG_HIDDEN);
+  for (lv_obj_t* l : lbl_slot) lv_obj_remove_flag(l, LV_OBJ_FLAG_HIDDEN);
   for (auto& b : g_glyph) if (b) { lv_draw_buf_destroy(b); b = nullptr; }
 }
 
