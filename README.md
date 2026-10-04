@@ -1,5 +1,7 @@
 # Fancy Clock for M5Stack Tab5
 
+Version 1.0.0 (see `CHANGELOG.md`; the running firmware reports its version at boot and in the `S` status).
+
 LVGL 9.x + M5GFX/M5Unified, 1280x720 landscape.
 
 ![Fancy Clock on the Tab5, mid-way through the hourly fireworks](docs/screenshot.png)
@@ -131,7 +133,8 @@ POSIX TZ examples: `EST5EDT,M3.2.0,M11.1.0` (US Eastern), `GMT0BST,M3.5.0/1,M10.
 - [LVGL](https://lvgl.io) (MIT), [M5GFX / M5Unified](https://github.com/m5stack) (MIT), Arduino-ESP32 / ESP-Hosted (Apache-2.0).
 - `fonts.h` embeds a subset of [Noto Sans](https://fonts.google.com/noto) Light and Medium, licensed under the
   SIL Open Font License 1.1.
-- No license has been chosen for this project's own code yet.
+- This project's own code is MIT-licensed (see `LICENSE`, copyright Yejun Yang); `fonts.h` stays under the OFL
+  (`LICENSE-fonts.txt`).
 
 ## Reliability and tests
 

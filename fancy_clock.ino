@@ -38,6 +38,7 @@
 // ----------------------------------------------------------------------------------------------
 // Configuration
 // ----------------------------------------------------------------------------------------------
+static constexpr const char* FIRMWARE_VERSION = "1.0.0";   // semantic versioning; see CHANGELOG.md
 static constexpr int      ROTATION   = 1;    // start-up orientation if the IMU can't tell: 1 = landscape, 3 = upside-down
 static constexpr int      ROT_HOLD_MS = 1200; // auto-rotate: a new orientation must be held this long before the screen turns
 static constexpr uint8_t  BRIGHTNESS = 200;  // 0..255
@@ -1996,7 +1997,7 @@ void setup() {
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.display();
   ppa_setup();
-  Serial.printf("\nFancy clock: display %dx%d, PSRAM %u bytes free\n", (int)M5.Display.width(), (int)M5.Display.height(),
+  Serial.printf("\nFancy clock %s: display %dx%d, PSRAM %u bytes free\n", FIRMWARE_VERSION, (int)M5.Display.width(), (int)M5.Display.height(),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
   prefs.begin("clock", false);

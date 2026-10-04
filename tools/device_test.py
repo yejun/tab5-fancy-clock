@@ -70,7 +70,7 @@ def main():
             # Assert the actual screen state so a reset cannot look like a pass.
             for cycle in range(3):
                 out = send(s, "U", 12)
-                require(not any(x in out for x in ("Guru Meditation", "assert failed", "Fancy clock: display")),
+                require(not any(x in out for x in ("Guru Meditation", "assert failed", "Fancy clock ")),
                         "Reset while opening WiFi setup")
                 require("wifi_ui=1" in status(s), "WiFi screen did not stay open")
                 read_screenshot(s, True)
@@ -125,7 +125,7 @@ def main():
             send(s, "K")
             for _ in range(13):
                 log = read_for(s, 5)
-                require(not any(x in log for x in ("Guru Meditation", "assert failed", "Fancy clock: display")), "Reset during theme stress test")
+                require(not any(x in log for x in ("Guru Meditation", "assert failed", "Fancy clock ")), "Reset during theme stress test")
             read_screenshot(s, True)
             status(s)
             print("PASS 20 theme switches without reset", flush=True)
@@ -136,7 +136,7 @@ def main():
                 send(s, f"T 2026-{month:02d}-15 {month:02d}:{month * 5 % 60:02d}:00")
                 status(s)
             out = send(s, "U", 12)
-            require(not any(x in out for x in ("Guru Meditation", "assert failed", "Fancy clock: display")),
+            require(not any(x in out for x in ("Guru Meditation", "assert failed", "Fancy clock ")),
                     "Reset during WiFi scan after calendar stress")
             current = status(s)
             require("wifi_ui=1" in current, "WiFi failed after calendar stress")

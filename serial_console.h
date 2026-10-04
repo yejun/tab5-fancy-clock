@@ -154,6 +154,7 @@ static void handle_serial() {
         Serial.printf("display=%d wifi_ui=%d brightness=%u rtc_pending=%lld\n", (int)g_disp_on.load(), (int)g_wifi_open,
                       (unsigned)g_bri, (long long)g_rtc_write_utc_s);
         Serial.printf("ui time=%s | date=%s | month=%s\n", lv_label_get_text(lbl_time), lv_label_get_text(lbl_date), lv_label_get_text(lbl_month));
+        Serial.printf("version=%s ", FIRMWARE_VERSION);
         Serial.printf("uptime_ms=%lld reset_reason=%d rtc_ready=%d rtc_lost=%d battery_presence=%d usb_only=%d\n", (long long)mono_ms(),
                       (int)esp_reset_reason(), (int)g_rtc_ready, [] { bool l = false; return rtc_time_lost(l) ? (int)l : -1; }(), (int)g_battery_presence.state, (int)g_usb_only);
         Serial.printf("battery: level=%d voltage=%dmV current=%dmA charging=%d external=%d chg_stat=%d charge_limit=%d charge_en=%d chg_en_out=%d chg_en_in=%d\n",
