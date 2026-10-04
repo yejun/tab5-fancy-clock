@@ -38,7 +38,7 @@ static void send_screenshot(bool framebuffer = false) {
   ScreenshotGuard guard;
   if (!guard.locked) { Serial.println("SNAPFAIL logging busy"); return; }
   lv_draw_buf_t* snap = nullptr;
-  if (!framebuffer) snap = lv_snapshot_take(g_wifi_open ? wifi_ui : lv_screen_active(), LV_COLOR_FORMAT_RGB565);
+  if (!framebuffer) snap = lv_snapshot_take(g_wifi_open ? wifi_ui : g_tz_open ? tz_ui : lv_screen_active(), LV_COLOR_FORMAT_RGB565);
   if ((framebuffer && !g_fb) || (!framebuffer && !snap)) { Serial.println("SNAPFAIL"); return; }
   const uint32_t w = framebuffer ? SCR_W : snap->header.w;
   const uint32_t h = framebuffer ? SCR_H : snap->header.h;
@@ -125,13 +125,7 @@ static void handle_serial() {
       case 'Z': {  // "Z <POSIX TZ>", e.g. "Z PST8PDT,M3.2.0,M11.1.0"
         const char* arg = line + 1;
         while (*arg == ' ') arg++;
-        if (*arg) {
-          g_tz = arg;
-          prefs.putString("tz", g_tz);
-          setenv("TZ", g_tz.c_str(), 1);
-          tzset();
-          g_dirty_all = true;
-        }
+        if (*arg) tz_apply(arg, "");
         Serial.printf("OK tz=%s\n", g_tz.c_str());
         break;
       }
@@ -246,6 +240,30 @@ static void handle_serial() {
             g_show_freeze = t;
           }
           Serial.printf("OK show %s%s\n", SHOWS[i].name, sp ? " (frozen)" : "");
+        }
+        break;
+      }
+      case 'J': {  // time zone screen: "J" toggles it, "J <n>" picks city n, "J list" prints every city's time and offset
+        const char* arg = line + 1;
+        while (*arg == ' ') arg++;
+        if (!strcmp(arg, "list")) {
+          const int64_t utc = now_utc_s();
+          for (int i = 0; i < N_TZ; i++) {
+            struct tm lt;
+            int off;
+            tz_eval(TZ_LIST[i].tz, utc, lt, off);
+            char ofs[16];
+            fmt_offset(ofs, sizeof(ofs), off);
+            Serial.printf("  %2d %-13s %02d:%02d %-9s %s\n", i, TZ_LIST[i].city, lt.tm_hour, lt.tm_min, ofs, TZ_LIST[i].tz);
+          }
+          tz_restore();
+          Serial.printf("OK %d zones, current %d\n", N_TZ, tz_current_index());
+        } else if (*arg) {
+          tz_select(atoi(arg));
+          Serial.printf("OK tz=%s\n", g_tz.c_str());
+        } else {
+          if (g_tz_open) tz_close(); else tz_open();
+          Serial.printf("OK tz screen %s\n", g_tz_open ? "open" : "closed");
         }
         break;
       }

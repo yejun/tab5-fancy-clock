@@ -1888,6 +1888,7 @@ static void display_set(bool on) {
 // ----------------------------------------------------------------------------------------------
 // Serial console (time sync, screenshots, debugging)
 // ----------------------------------------------------------------------------------------------
+#include "tz_ui.h"
 #include "shows.h"
 #include "serial_console.h"
 
@@ -1914,6 +1915,8 @@ static void run_tap(int x, int y) {
     batt_open();
   } else if (x >= PX + PW - 260 && y < 90) {        // WiFi icon, left of it
     wifi_open();
+  } else if (x >= PX && x < PX + 350 && y < 84) {   // the greeting
+    tz_open();
   } else if (x >= PX && y < 250) {                  // the big digits
     g_24h = !g_24h;
     prefs.putBool("h24", g_24h);
@@ -1937,7 +1940,7 @@ static void handle_touch() {
   const auto t = M5.Touch.getDetail();
   const bool pressed = t.isPressed();
 
-  if (g_wifi_open) { down = adjusting = pending = false; return; }
+  if (g_wifi_open || g_tz_open) { down = adjusting = pending = false; return; }
 
   if (pressed && !down) {                           // finger down
     down = true; adjusting = false;
@@ -2008,6 +2011,7 @@ void setup() {
   g_ssid = prefs.getString("ssid", "");
   g_pass = prefs.getString("pass", "");
   g_tz = prefs.getString("tz", g_tz);
+  g_tz_name = prefs.getString("tzname", "");
   setenv("TZ", g_tz.c_str(), 1);
   tzset();
   if (!g_ssid.isEmpty()) snprintf(g_net_state, sizeof(g_net_state), "waiting to sync");
@@ -2038,6 +2042,7 @@ void setup() {
 
   build_dynamic_ui();
   wifi_build();
+  tz_build();
   bri_build();
   batt_build();
   shows_build();
@@ -2093,7 +2098,7 @@ void loop() {
     g_frames_by_pos[pos]++;
     if (esp_timer_get_time() - t > 40000) g_slow_by_pos[pos]++;
   }
-  if (!g_wifi_open && !g_show_running) render_pending_themes();   // a ~0.5 s stall: not mid-show
+  if (!g_wifi_open && !g_tz_open && !g_show_running) render_pending_themes();   // a ~0.5 s stall: not mid-show
   g_busy_us += esp_timer_get_time() - t_loop;
   // Sleep until LVGL's next timer is due (the idle task halts the CPU meanwhile), but wake every TOUCH_MS to
   // poll the touch panel, and every 4 ms while phase-locking to the RTC.

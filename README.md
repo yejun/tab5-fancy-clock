@@ -21,6 +21,8 @@ then `mise run test | flash | device-test`. Without mise: `python3 -m venv .venv
     active; the clock keeps time). While off, any tap wakes it - the picture is refreshed *before* the backlight
     comes on, so the second hand doesn't jump. (Panel sleep and CPU down-clocking were tried and don't work on the
     Tab5: panel sleep also disables touch, and 40 MHz starves the MIPI-DSI controller. See comments in the code.)
+  - **Tap the greeting** ("GOOD EVENING") → time zone: about 60 major cities in alphabetical order, each with its
+    current local time and UTC offset (daylight saving included); tap one to switch (remembered).
   - **Tap the big digits** → 12h/24h. **Tap the WiFi icon** (top right) → WiFi setup. **Tap the battery icon** →
     a card with level, charging state, voltage (pack and per cell), current, power and a rough time-left /
     time-to-full estimate (2000 mAh pack, smoothed current); refreshed every second. Tap the bottom row to switch the battery display between Auto and USB only;
@@ -115,6 +117,7 @@ POSIX TZ examples: `EST5EDT,M3.2.0,M11.1.0` (US Eastern), `GMT0BST,M3.5.0/1,M10.
     tools/clockctl.py cmd A          # accelerometer reading and the orientation it asks for
     tools/clockctl.py cmd G          # open/close the battery card
     tools/clockctl.py cmd "V usb"    # saved USB-only display (no battery fitted); "V auto" restores detection
+    tools/clockctl.py cmd "J list"   # every time-zone city with its local time and offset; "J <n>" picks one, "J" opens the screen
     tools/clockctl.py cmd "L off"    # charge limit off (charge to 100%); "L on" holds the pack at 80-90%
     tools/clockctl.py cmd K          # stress test: 20 automatic theme switches
     tools/clockctl.py cmd H<mask>    # debug: 1=hide day ring 2=hand shadows 4=soft shadow penumbra 8=region merging

@@ -1271,7 +1271,7 @@ static void show_stop() {
 }
 
 static void show_start(int idx) {
-  if (idx < 0 || idx >= N_SHOWS || !g_disp_on || g_wifi_open) return;
+  if (idx < 0 || idx >= N_SHOWS || !g_disp_on || g_wifi_open || g_tz_open) return;
   show_stop();
   if (g_batt_open) batt_close();
   if (SHOWS[idx].begin) SHOWS[idx].begin();   // before the show is visible to the draw callback
@@ -1293,7 +1293,7 @@ static void show_start(int idx) {
 // Called from fast_cb every frame, before the composite is applied.
 static void shows_update(const Now& n) {
   if (g_show >= 0) {
-    if (!g_disp_on || g_wifi_open || g_batt_open) { show_stop(); return; }
+    if (!g_disp_on || g_wifi_open || g_tz_open || g_batt_open) { show_stop(); return; }
     const float t = g_show_freeze >= 0 ? g_show_freeze : (esp_timer_get_time() - g_show_t0) / 1e6f;
     if (g_show_freeze < 0 && t * 1000 >= SHOWS[g_show].duration_ms) { show_stop(); return; }
     const int64_t t0 = esp_timer_get_time();
@@ -1306,6 +1306,6 @@ static void shows_update(const Now& n) {
   if (!g_shows_enabled || n.mi != 0 || n.s > 1 || n.h == g_show_last_hour) return;
   if (n.h < SHOW_FIRST_HOUR || n.h > SHOW_LAST_HOUR || N_SHOWS <= FIRST_REAL_SHOW) return;
   g_show_last_hour = n.h;
-  if (g_batt_open || g_wifi_open) return;   // don't pull a card away from someone reading it: skip this hour
+  if (g_batt_open || g_wifi_open || g_tz_open) return;   // don't pull a card away from someone reading it: skip this hour
   show_start(FIRST_REAL_SHOW + (int)(esp_random() % (N_SHOWS - FIRST_REAL_SHOW)));
 }
