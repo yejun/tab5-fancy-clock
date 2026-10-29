@@ -64,8 +64,8 @@ hand holds still while one runs; a tap ends it. Measured on the device while ani
 | `fireworks` | rockets burst into streaking sparks over the dial | 21-23 | 78 ms |
 | `numerals` | the numerals lift off, orbit on a tilted ring in perspective and land again | 15-16 | 93 ms |
 | `flap` | flip-board cards fade in under the digits, which cascade through random digits to the time | 28-29 | 168 ms |
-| `dialflip` | the dial turns over in 3D to a back face with the time and date, and back | 23 | 63 ms |
-| `aurora` | a curtain of light ripples across the top of the screen | 17 | 62 ms |
+| `dialflip` | the dial turns over in 3D to a back face with the time and date, and back | 24 | 62 ms |
+| `aurora` | a curtain of light ripples across the top of the screen | 31-35 | 33 ms |
 
 How they stay fast:
 - **Core 0 does the pixel work** one frame ahead (double-buffered); core 1 runs LVGL as usual.
@@ -76,6 +76,13 @@ How they stay fast:
 - **Dial flip and aurora bypass LVGL** for their region and write the panel's frame buffer directly: the panel is
   portrait, so a screen column is one contiguous frame-buffer row, and both effects work column by column on
   column-major data. Routing a full-dial image through LVGL and the PPA every frame saturated PSRAM (~10 fps).
+- **Aurora's light runs on the P4's SIMD unit (PIE)**, 8 pixels at a time (`pie.h`): 10x faster than the C version of
+  the same per-pixel maths, which it matches exactly; at start-up both run on random data and PIE is only used if
+  they agree (serial `R` repeats the check, `R <n>` stress-tests). The worker went from 52 to 28 ms a frame (the
+  same frame, copied without any maths, takes 17 ms). Core-0 shows also poll their worker every 4 ms instead of on
+  the 30 ms show tick, so a frame starts as soon as the last one is done: 18 -> 31-35 fps.
+- The **dial flip** is limited by memory, not maths: without its shading and blending a frame still takes 33 of its
+  46 ms, so it stays in C.
 - Serial: `O` lists the shows, `O <n>` plays one and prints its frame statistics, `O <n> <t>` holds it at t seconds
   (for screenshots), `O x` stops, `O on|off` turns the hourly schedule on or off.
 
@@ -141,7 +148,8 @@ POSIX TZ examples: `EST5EDT,M3.2.0,M11.1.0` (US Eastern), `GMT0BST,M3.5.0/1,M10.
 ## Other helpers
     tools/clockctl.py shot out.png   # screenshot over USB serial (out_fb.png: read back from the panel frame buffer)
     tools/clockctl.py cmd S|C|M      # status+timing stats / next theme / toggle 12-24h
-    tools/clockctl.py cmd A          # accelerometer reading and the orientation it asks for
+    tools/clockctl.py cmd A          # accelerometer reading and the orientation it asks for ("A 1|3" forces one, "A auto")
+    tools/clockctl.py cmd R          # PIE kernels: check against C and time both; "R 100000" stress rounds
     tools/clockctl.py cmd G          # open/close the battery card
     tools/clockctl.py cmd "V usb"    # saved USB-only display (no battery fitted); "V auto" restores detection
     tools/clockctl.py cmd "J list"   # every time-zone city with its local time and offset; "J <n>" picks one, "J" opens the screen

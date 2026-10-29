@@ -3,6 +3,12 @@
 Versions follow [semantic versioning](https://semver.org). The firmware reports its version at boot and in the
 serial `S` status.
 
+## Unreleased
+
+- Aurora show: its per-pixel light on the P4's SIMD unit (PIE, `pie.h`, checked against the C version at start-up),
+  and core-0 shows start each frame as soon as the last one is done: aurora 18 -> 31-35 fps.
+- Serial: `R` (PIE check / stress test), `A 1|3` / `A auto` (force a rotation for testing).
+
 ## 1.1.0 - 2026-10-28
 
 - Hourly announcement: a two-note bell and the spoken hour (clips from the Halo watch project), with a volume

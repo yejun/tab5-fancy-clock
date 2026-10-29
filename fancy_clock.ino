@@ -1762,6 +1762,7 @@ static constexpr float ORIENT_SIGN = -1;       // gravity along +axis (times thi
                                                // (on the device: upright in rotation 1 reads x = -1.0 g)
 static constexpr float ORIENT_MIN_G = 0.5f;    // in-plane gravity needed, in g (~30 degrees of tilt from flat)
 static bool g_imu_ok = false;
+static bool g_rot_forced = false;   // serial "A 1|3": auto-rotation paused
 
 static void imu_setup() {
   g_imu_ok = M5.Imu.isEnabled();
@@ -1801,7 +1802,7 @@ static void orient_tick(bool now) {
   static int64_t next = 0, cand_since = 0;
   static int cand = 0;
   const int64_t t = mono_ms();
-  if (!g_imu_ok || (!now && t < next)) return;
+  if (!g_imu_ok || g_rot_forced || (!now && t < next)) return;
   next = t + ORIENT_POLL_MS;
   const int r = orient_sample();
   if (r == 0 || r == g_rot) { cand = 0; return; }
@@ -1900,6 +1901,7 @@ static void display_set(bool on) {
 // Serial console (time sync, screenshots, debugging)
 // ----------------------------------------------------------------------------------------------
 #include "tz_ui.h"
+#include "pie.h"
 #include "shows.h"
 #include "night_ui.h"
 #include "serial_console.h"
@@ -2028,6 +2030,7 @@ void setup() {
   g_usb_only = prefs.getBool("batt_usb", false);
   g_charge_limit.enabled = prefs.getBool("chg_lim", true);
   settings_load();
+  pie_setup();
   g_bri = (uint8_t)constrain((int)prefs.getUChar("bri", BRIGHTNESS), MIN_BRIGHTNESS, 255);
   M5.Display.setBrightness(g_bri);
 

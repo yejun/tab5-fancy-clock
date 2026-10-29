@@ -4,6 +4,9 @@
 // runs, fast_cb is called every SHOW_FRAME_MS; the frame rate is then limited by rendering + flushing.
 
 static constexpr int SHOW_FRAME_MS = 30;
+static constexpr int SHOW_POLL_MS = 4;   // shows rendered on core 0 poll it this often: a frame starts as soon as the
+                                         // last one is done, not on the next 30 ms tick (a 35 ms frame took 60)
+static int g_show_period = SHOW_FRAME_MS;
 static void settings_close();   // night_ui.h
 
 struct ShowDef {
@@ -995,6 +998,7 @@ static HOT void df_prepare(float) {
 
 static void dialflip_begin() {
   const int64_t t0 = esp_timer_get_time();
+  g_show_period = SHOW_POLL_MS;
   const Theme& th = THEMES[g_theme];
   show_work_wait();
   df_free();
@@ -1040,7 +1044,7 @@ static void dialflip_begin() {
     lv_obj_delete(scr);
   }
   g_df_ok = true;
-  g_df_wait = 3;
+  g_df_wait = 3 * SHOW_FRAME_MS / g_show_period;   // ~90 ms
   g_df_t0 = -1;
   g_df_drawn = g_df_pending = 0;
   g_df_us = 0; g_df_frames = 0;
@@ -1110,9 +1114,17 @@ static inline float fsin(float x) {
   return z * (1 - z2 * (0.16666667f - z2 * (0.0083333f - z2 * 0.000198f)));
 }
 
-static constexpr int AU_H = 300;                       // band height, from the top of the screen
+static constexpr int AU_H = 304;                       // band height, from the top of the screen (a multiple of 8,
+                                                       // so each column is whole 16-byte vectors in the frame buffer)
+static constexpr int AU_FB0[2] = {0, FB_W - AU_H};     // where the band starts in a frame-buffer row: rotation 3, 1
+// Colour by distance d above the curtain's edge, as pie.h's 8-pixel blocks, per orientation and in frame-buffer
+// order: rotation 1 walks d upwards (index d + AU_D1), rotation 3 downwards (index AU_D3 - d). Each column starts
+// at a whole block if the edge used for the colour is 7 mod 8 (it is rounded so: <= 4 rows, invisible in the ramp).
+static constexpr int AU_D1 = AU_H, AU_D3 = 287, AU_TAB_N = 592;
+alignas(16) static uint16_t g_au_tab[2][AU_TAB_N / 8 * AU_TAB_BLOCK];
+alignas(16) static uint16_t g_au_w[AU_H];              // one column's light weights, frame-buffer order
 static constexpr float AU_T = 10.0f;
-static uint16_t* g_au_base = nullptr;                  // the band as it was, column-major [x * AU_H + y]
+static uint16_t* g_au_base = nullptr;                  // the band as it was: [x * AU_H + frame-buffer order]
 static uint8_t g_au_ramp[AU_H][3];                     // colour by distance above the curtain's edge: acc1 -> acc3
 static bool g_au_ok = false;
 static float g_au_t0 = -1;
@@ -1122,7 +1134,6 @@ static int g_au_frames = 0;
 
 static HOT void au_render(float t) {   // show worker (core 0)
   const int64_t t0 = esp_timer_get_time();
-  const Theme& th = THEMES[g_theme];
   const float env = ease(t / 1.5f) * (1 - ease((t - (AU_T - 2.0f)) / 1.8f));
   const bool rot1 = g_rot == 1;
   for (int x = 0; x < SCR_W; x++) {
@@ -1133,29 +1144,26 @@ static HOT void au_render(float t) {   // show worker (core 0)
     I *= 0.78f + 0.22f * fsin(x * 0.37f + t * 2.1f) * fsin(x * 0.11f - t * 0.7f);   // fine rays
     I = fmaxf(0, I) * env;
     const float L = 70 + 30 * fsin(fx * 5.0f + t * 0.4f);                          // how far the glow reaches up
-    uint16_t* fbrow = g_fb + (rot1 ? x : FB_H - 1 - x) * FB_W;
-    uint16_t* o = rot1 ? fbrow + (FB_W - 1) : fbrow;   // screen y = 0
-    const int step = rot1 ? -1 : 1;
-    const uint16_t* base = g_au_base + x * AU_H;
     const int ybi = (int)yb;
-    (void)th;
-    const int32_t k_up = (int32_t)(65536 * (1 - 1 / L + 0.5f / (L * L)));          // ~exp(-1/L), 16.16
+    // the light's weight per row: a soft falloff below the edge (few rows, float is fine), above it a glow
+    // decaying by k_up per row; nothing below edge
+    const float k_up = 1 - 1 / L + 0.5f / (L * L);                                 // ~exp(-1/L)
     const int edge = min(AU_H - 1, ybi + 12);
-    for (int y = AU_H - 1; y > edge; y--) o[y * step] = base[y];
-    // below the edge: a soft falloff (few rows, float is fine); above it: the glow decays by k_up per row
-    int32_t w = (int32_t)(I * 220 * 65536);                                        // 16.16, 220 = full strength
-    for (int y = edge; y >= 0; y--) {
-      int wi;
-      if (y > ybi) { const float d = (y - yb) / 6.0f; wi = (int)(I * 220 * gauss(2 * d * d)); }
-      else { wi = w >> 16; w = (int32_t)(((int64_t)w * k_up) >> 16); }
-      const uint16_t v = base[y];
-      if (wi <= 0) { o[y * step] = v; continue; }
-      const uint8_t* c = g_au_ramp[min(AU_H - 1, max(0, ybi - y))];
-      const int r = min(255, ((v >> 8) & 0xF8) + ((c[0] * wi) >> 8));
-      const int g = min(255, ((v >> 3) & 0xFC) + ((c[1] * wi) >> 8));
-      const int b = min(255, ((v << 3) & 0xF8) + ((c[2] * wi) >> 8));
-      o[y * step] = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+    uint16_t* W = g_au_w;
+    const int wstep = rot1 ? -1 : 1;
+    uint16_t* wy = rot1 ? W + AU_H - 1 : W;                                         // screen y = 0
+    for (int y = AU_H - 1; y > edge; y--) wy[y * wstep] = 0;
+    for (int y = edge; y > ybi && y >= 0; y--) {
+      const float d = (y - yb) / 6.0f;
+      wy[y * wstep] = (uint16_t)(I * 220 * gauss(2 * d * d));
     }
+    float w = I * 220;                                                             // 220 = full strength (I <= 1)
+    for (int y = min(ybi, edge); y >= 0; y--, w *= k_up) wy[y * wstep] = (uint16_t)w;
+    const int ybq = constrain(((ybi - 3) & ~7) + 7, 7, AU_D3);                      // the colour's edge: 7 mod 8
+    const int t0i = rot1 ? ybq - (AU_H - 1) + AU_D1 : AU_D3 - ybq;                  // table index of the band's start
+    const uint16_t* tab = g_au_tab[rot1] + t0i / 8 * AU_TAB_BLOCK;
+    uint16_t* fbrow = g_fb + (rot1 ? x : FB_H - 1 - x) * FB_W;
+    au_px(g_au_base + x * AU_H, W, tab, fbrow + AU_FB0[rot1], AU_H);
   }
   const int64_t t1 = esp_timer_get_time();
   uint16_t* first = g_fb + (rot1 ? 0 : FB_H - SCR_W) * FB_W;
@@ -1167,8 +1175,9 @@ static HOT void au_render(float t) {   // show worker (core 0)
 
 static void aurora_begin() {
   g_au_ok = false;
+  g_show_period = SHOW_POLL_MS;
   if (!g_fb) return;
-  if (!g_au_base) g_au_base = (uint16_t*)heap_caps_malloc(SCR_W * AU_H * 2, MALLOC_CAP_SPIRAM);
+  if (!g_au_base) g_au_base = (uint16_t*)heap_caps_aligned_alloc(16, SCR_W * AU_H * 2, MALLOC_CAP_SPIRAM);
   if (!g_au_base) return;
   const Theme& th = THEMES[g_theme];
   for (int d = 0; d < AU_H; d++) {
@@ -1178,9 +1187,16 @@ static void aurora_begin() {
       g_au_ramp[d][ch] = (uint8_t)(a + (((b - a) * m) >> 8));
     }
   }
+  for (int o = 0; o < 2; o++)   // o = 1: rotation 1
+    for (int i = 0; i < AU_TAB_N; i++) {
+      const int d = o ? i - AU_D1 : AU_D3 - i;
+      const uint8_t* c = g_au_ramp[max(0, min(AU_H - 1, d))];
+      uint16_t* blk = g_au_tab[o] + i / 8 * AU_TAB_BLOCK + i % 8;
+      blk[0] = c[0]; blk[8] = (uint16_t)(2 * c[1]); blk[16] = c[2];
+    }
   g_au_ok = true;
   g_au_t0 = -1;
-  g_au_wait = 3;          // let LVGL bring the screen up to date before the band is copied
+  g_au_wait = 3 * SHOW_FRAME_MS / g_show_period;   // ~90 ms: LVGL brings the screen up to date before the band is copied
   g_au_us = g_au_sync_us = 0; g_au_frames = 0;
 }
 
@@ -1196,7 +1212,7 @@ static void aurora_tick(float t) {
     const bool rot1 = g_rot == 1;
     for (int x = 0; x < SCR_W; x++) {
       const uint16_t* fbrow = g_fb + (rot1 ? x : FB_H - 1 - x) * FB_W;
-      for (int y = 0; y < AU_H; y++) g_au_base[x * AU_H + y] = rot1 ? fbrow[FB_W - 1 - y] : fbrow[y];
+      memcpy(g_au_base + x * AU_H, fbrow + AU_FB0[rot1], AU_H * 2);   // kept in frame-buffer order
     }
     g_show_owns_dial = true;      // hold composite updates (the dial's top is in the band)
     g_au_t0 = t;
@@ -1214,8 +1230,8 @@ static void aurora_draw(lv_layer_t*) {}
 static void aurora_end() {
   show_work_wait();
   if (g_au_frames)
-    Serial.printf("  aurora worker: %.1f ms per frame, of which cache write-back %.1f ms (%d frames)\n",
-                  g_au_us / 1000.0 / g_au_frames, g_au_sync_us / 1000.0 / g_au_frames, g_au_frames);
+    Serial.printf("  aurora worker: %.1f ms per frame, of which cache write-back %.1f ms (%d frames, %s)\n",
+                  g_au_us / 1000.0 / g_au_frames, g_au_sync_us / 1000.0 / g_au_frames, g_au_frames, g_pie_aurora ? "PIE" : "C");
   g_show_owns_dial = false;
   g_dirty_all = true;
   heap_caps_free(g_au_base);
@@ -1275,6 +1291,7 @@ static void show_start(int idx) {
   show_stop();
   if (g_batt_open) batt_close();
   if (g_settings_open) settings_close();
+  g_show_period = SHOW_FRAME_MS;
   if (SHOWS[idx].begin) SHOWS[idx].begin();   // before the show is visible to the draw callback
   g_show = idx;
   g_show_running = true;
@@ -1287,7 +1304,7 @@ static void show_start(int idx) {
   g_frame_last_us = 0;
   g_frame_track_t0 = esp_timer_get_time();
   g_frame_track = true;
-  lv_timer_set_period(g_fast_timer, SHOW_FRAME_MS);
+  lv_timer_set_period(g_fast_timer, g_show_period);
   Serial.printf("show %s started\n", SHOWS[idx].name);
 }
 

@@ -199,10 +199,16 @@ static void handle_serial() {
         break;
       }
       case 'F': send_screenshot(true); break;
-      case 'A': {  // accelerometer + orientation (for checking ORIENT_AXIS / ORIENT_SIGN)
+      case 'A': {  // accelerometer + orientation (for checking ORIENT_AXIS / ORIENT_SIGN); "A 1|3" forces a rotation
+                   // and pauses auto-rotation (testing), "A auto" resumes it
+        const char* arg = line + 1;
+        while (*arg == ' ') arg++;
+        if (*arg == '1' || *arg == '3') { g_rot_forced = true; set_rotation(*arg - '0'); }
+        else if (!strcmp(arg, "auto")) { g_rot_forced = false; orient_tick(true); }
         float x = 0, y = 0, z = 0;
         if (g_imu_ok) M5.Imu.getAccel(&x, &y, &z);
         Serial.printf("OK accel x=%.2f y=%.2f z=%.2f g | wants rotation %d, showing %d\n", x, y, z, orient_sample(), g_rot);
+        if (g_rot_forced) Serial.println("  (rotation forced: A auto resumes auto-rotation)");
         break;
       }
       case 'V':
@@ -217,6 +223,11 @@ static void handle_serial() {
         else { Serial.println("ERR usage: L on|off"); break; }
         Serial.printf("OK charge limit %s\n", g_charge_limit.enabled ? "80-90%" : "off");
         break;
+      case 'R': {  // PIE kernels: "R" checks them against C and times both, "R <n>" n stress rounds
+        const int n = atoi(line + 1);
+        if (n > 0) pie_stress(n); else pie_check(true);
+        break;
+      }
       case 'I': {  // announcement: "I" now (current hour), "I <h>" hour h, "I c" bell only, "I v <0-255>" volume
         const char* arg = line + 1;
         while (*arg == ' ') arg++;
