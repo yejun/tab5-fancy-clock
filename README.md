@@ -1,13 +1,13 @@
 # Fancy Clock for M5Stack Tab5
 
-Version 1.0.0 (see `CHANGELOG.md`; the running firmware reports its version at boot and in the `S` status).
+Version 1.1.0 (see `CHANGELOG.md`; the running firmware reports its version at boot and in the `S` status).
 
 LVGL 9.x + M5GFX/M5Unified, 1280x720 landscape.
 
 ![Fancy Clock on the Tab5, mid-way through the hourly fireworks](docs/screenshot.png)
 
 Requires: Arduino CLI, the `m5stack:esp32` core (3.3.x), and the libraries `lvgl` (9.x), `M5GFX`, `M5Unified`.
-The current code builds with core 3.3.9, LVGL 9.6.0, M5GFX 0.2.30 and M5Unified 0.2.23.
+The current code builds with core 3.3.9, LVGL 9.6.0, M5GFX 0.2.33 and M5Unified 0.2.25.
 The Python device tools require `pyserial`; saving PNG screenshots also requires `numpy` and `Pillow` (see `requirements.txt`).
 With [mise](https://mise.jdx.dev), `mise trust && mise run setup` creates and activates `.venv` in this directory;
 then `mise run test | flash | device-test`. Without mise: `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`.
@@ -36,8 +36,26 @@ then `mise run test | flash | device-test`. Without mise: `python3 -m venv .venv
   the glass never turns it. Only the accelerometer runs (the gyro is switched off); it is read 5x a second while the
   display is on. A turn is one full redraw - LVGL keeps drawing in landscape, only the PPA flush rotates differently.
 
+## Settings, announcement and night mode
+Tap the gear in the calendar header for the settings card (remembered across reboots):
+- **Hourly announcement** - on the hour, a two-note bell and the spoken hour ("It's nine o'clock.", "Good morning. It's
+  seven o'clock.", ...). Plays with the display off too. The ES8388 codec and its amplifier are powered only while it
+  plays. **Volume**: tap the bar; the bell plays as a preview.
+- **Hourly show** - one of the animations below.
+- **Night mode** (on by default) - from 23:00 to 07:00 the clock keeps its layout (dial, digital time, date,
+  calendar) but draws it as a faint red outline on black, with no second hand or seconds bar, redrawn once a minute
+  (~2% CPU against ~20% by day) at its own backlight level (drag left/right while it is up to set it). Both hourly
+  features keep quiet during those hours; the last ones of the evening are at 22:00, the first at 07:00. A tap shows the
+  normal clock for 30 s; a tap on the gear (drawn at night too) opens the settings straight away. With night mode off, both hourly features run
+  around the clock.
+
+The clips come from the Halo watch project (`waveshare2`): `tools/make_clips.py` embeds its 16 kHz bell and 24 spoken
+hours (Gemini TTS) as `voice_clips.h` (~1 MB of flash). Serial: `I` announces the current hour, `I <h>` hour h, `I c`
+the bell alone, `I v <0-255>` sets the volume; `X` prints the settings, `X chime|show|night on|off` changes them,
+`X ui` opens the card, `X peek` ends a night-time peek.
+
 ## Hourly shows
-On the hour (07:00-22:00; `O off` disables them) the clock plays one of six short shows, picked at random. The second
+On the hour (see night mode above; `O off` disables them) the clock plays one of six short shows, picked at random. The second
 hand holds still while one runs; a tap ends it. Measured on the device while animating (fps, worst frame):
 
 | Show | | fps | worst |
@@ -82,7 +100,14 @@ With the display on, the CPU is busy ~19% of the time (it was ~80% at 27 fps bef
     tools/build.sh upload     # compile + flash /dev/ttyACM0
 
 Board options are set in `tools/build.sh`. `ChipVariant=prev3` is for ESP32-P4 silicon older than v3.00
-(esptool prints `revision v1.x`); use `postv3` for newer units. `lv_conf.h` lives next to the sketch.
+(esptool prints `revision v1.x`), which is what the Tab5 ships with; `postv3` would be for newer chips.
+`lv_conf.h` lives next to the sketch.
+
+## Download
+Ready-made firmware is on the [releases page](https://github.com/yejun/tab5-fancy-clock/releases): one image,
+written at address 0x0 (M5Burner, or `esptool --chip esp32p4 write-flash 0x0 <image>.bin`). Writing it clears the
+saved settings, so choose the WiFi network again afterwards. Releases ship the prev3 image only, since M5Stack hasn't
+released a Tab5 with a v3.x chip yet. Each release also carries the third-party notices and the corresponding source.
 
 ## Time
 Three sources, best first:
@@ -131,6 +156,7 @@ POSIX TZ examples: `EST5EDT,M3.2.0,M11.1.0` (US Eastern), `GMT0BST,M3.5.0/1,M10.
 
 ## Credits
 - [LVGL](https://lvgl.io) (MIT), [M5GFX / M5Unified](https://github.com/m5stack) (MIT), Arduino-ESP32 / ESP-Hosted (Apache-2.0).
+- `voice_clips.h`: the bell and spoken hours from the Halo watch project (bell synthesised, voice by Gemini TTS).
 - `fonts.h` embeds a subset of [Noto Sans](https://fonts.google.com/noto) Light and Medium, licensed under the
   SIL Open Font License 1.1.
 - This project's own code is MIT-licensed (see `LICENSE`, copyright Yejun Yang); `fonts.h` stays under the OFL

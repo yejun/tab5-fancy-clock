@@ -217,6 +217,38 @@ static void handle_serial() {
         else { Serial.println("ERR usage: L on|off"); break; }
         Serial.printf("OK charge limit %s\n", g_charge_limit.enabled ? "80-90%" : "off");
         break;
+      case 'I': {  // announcement: "I" now (current hour), "I <h>" hour h, "I c" bell only, "I v <0-255>" volume
+        const char* arg = line + 1;
+        while (*arg == ' ') arg++;
+        if (*arg == 'v') { if (arg[1]) set_volume(atoi(arg + 1)); Serial.printf("OK volume %u\n", (unsigned)g_volume); break; }
+        const int h = *arg == 'c' ? -1 : *arg ? atoi(arg) : now_local().h;
+        if (h < -1 || h > 23) { Serial.println("ERR usage: I [h|c|v <0-255>]"); break; }
+        announce_start(h);
+        Serial.printf("OK announce %d (volume %u)\n", h, (unsigned)g_volume);
+        break;
+      }
+      case 'X': {  // settings: "X" prints them, "X chime|show|night on|off", "X peek" ends a peek, "X ui" card
+        const char* arg = line + 1;
+        while (*arg == ' ') arg++;
+        const char* v = strchr(arg, ' ');
+        const bool on = v && !strcmp(v + 1, "on");
+        if (v && (on || !strcmp(v + 1, "off"))) {
+          if (!strncmp(arg, "chime", 5)) set_chime(on);
+          else if (!strncmp(arg, "show", 4)) set_shows(on);
+          else if (!strncmp(arg, "night", 5)) set_night_mode(on);
+          else { Serial.println("ERR usage: X [chime|show|night on|off | peek | ui]"); break; }
+          if (g_settings_open) settings_refresh();
+        } else if (!strcmp(arg, "peek")) {
+          g_peek_until = 0;
+        } else if (!strcmp(arg, "ui")) {   // open/close the settings card
+          if (g_settings_open) settings_close(); else settings_open();
+        } else if (*arg) { Serial.println("ERR usage: X [chime|show|night on|off | peek | ui]"); break; }
+        lv_timer_ready(g_fast_timer);
+        Serial.printf("OK chime=%d show=%d night=%d night_display=%d volume=%u brightness=%u night_brightness=%u\n",
+                      g_chime_enabled, g_shows_enabled, g_night_mode, g_night_on, (unsigned)g_volume, (unsigned)g_bri,
+                      (unsigned)g_bri_night);
+        break;
+      }
       case 'O': {  // shows: "O" lists them, "O <n>" starts one, "O x" stops, "O on|off" hourly schedule
         const char* arg = line + 1;
         while (*arg == ' ') arg++;

@@ -3,6 +3,18 @@
 Versions follow [semantic versioning](https://semver.org). The firmware reports its version at boot and in the
 serial `S` status.
 
+## 1.1.0 - 2026-10-28
+
+- Hourly announcement: a two-note bell and the spoken hour (clips from the Halo watch project), with a volume
+  setting; codec and amplifier are powered only while it plays.
+- Night mode (23:00-07:00, on by default): the normal layout as a faint red outline at a separate backlight level,
+  no second hand or seconds bar, ~2% CPU; the hourly announcement and show stay quiet. A tap shows the normal clock
+  for 30 s. With night mode off, both hourly features run around the clock (1.0.0 always skipped 23:00-06:00).
+- Settings card (gear in the calendar header): hourly announcement, volume, hourly show, night mode.
+- Serial: `I` (announcement, volume), `X` (settings).
+- The LICENSE file is the plain MIT text, so GitHub recognises it; the fonts' OFL note is in the README.
+- Firmware images no longer contain this computer's directory names.
+
 ## 1.0.0 - 2026-10-04
 
 First versioned release.

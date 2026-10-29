@@ -67,3 +67,12 @@ static bool rtc_write_due(int64_t utc_ms, int64_t& target_s) {
   if (utc_ms >= target_s * 1000 + 100) { target_s = utc_ms / 1000 + 1; return false; }
   return true;
 }
+
+// Day and night. The hourly features (announcement, show) fire on the hour from DAY_FIRST_HOUR through
+// DAY_LAST_HOUR, so the last one is at 22:00; night is the rest, 23:00-06:59. Night only matters while night mode is
+// on: then the clock turns into a faint red outline and the hourly features keep quiet. With night mode off they
+// run around the clock.
+static constexpr int DAY_FIRST_HOUR = 7, DAY_LAST_HOUR = 22;
+static inline bool is_night_hour(int h) { return h < DAY_FIRST_HOUR || h > DAY_LAST_HOUR; }
+static inline bool night_active(bool night_mode, int h) { return night_mode && is_night_hour(h); }
+static inline bool hourly_allowed(bool enabled, bool night_mode, int h) { return enabled && !night_active(night_mode, h); }

@@ -166,5 +166,15 @@ int main() {
       assert(covered);
     }
   }
-  puts("Clock/calendar, DST, migration, refresh keys, RTC deadlines, CRC and serial backpressure: PASS");
+  // Night is 23:00-06:59; hourly features are quiet then only with night mode on.
+  for (int h = 0; h < 24; ++h) {
+    const bool night = h == 23 || h < 7;
+    assert(is_night_hour(h) == night);
+    assert(!night_active(false, h) && night_active(true, h) == night);
+    assert(hourly_allowed(true, false, h));               // night mode off: around the clock
+    assert(hourly_allowed(true, true, h) == !night);
+    assert(!hourly_allowed(false, false, h) && !hourly_allowed(false, true, h));
+  }
+  assert(hourly_allowed(true, true, 7) && hourly_allowed(true, true, 22) && !hourly_allowed(true, true, 23));
+  puts("Clock/calendar, DST, migration, refresh keys, RTC deadlines, CRC, serial backpressure and night hours: PASS");
 }

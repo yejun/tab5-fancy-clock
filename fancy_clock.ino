@@ -38,7 +38,7 @@
 // ----------------------------------------------------------------------------------------------
 // Configuration
 // ----------------------------------------------------------------------------------------------
-static constexpr const char* FIRMWARE_VERSION = "1.0.0";   // semantic versioning; see CHANGELOG.md
+static constexpr const char* FIRMWARE_VERSION = "1.1.0";   // semantic versioning; see CHANGELOG.md
 static constexpr int      ROTATION   = 1;    // start-up orientation if the IMU can't tell: 1 = landscape, 3 = upside-down
 static constexpr int      ROT_HOLD_MS = 1200; // auto-rotate: a new orientation must be held this long before the screen turns
 static constexpr uint8_t  BRIGHTNESS = 200;  // 0..255
@@ -71,6 +71,9 @@ static const char* const WEEKDAYS[] = {"Sunday", "Monday", "Tuesday", "Wednesday
 // ----------------------------------------------------------------------------------------------
 static bool g_dirty_all = true;
 static Preferences prefs;
+static bool g_night_mode = true;       // night mode setting (see clock_logic.h / night_ui.h)
+static bool g_night_on = false;        // the night display is up right now
+static bool g_settings_open = false;   // the settings card is open
 #include "timekeeping.h"
 #include "network.h"
 
@@ -1289,6 +1292,8 @@ static uint16_t g_frames_by_pos[12];
 static int g_auto_left = 0;  // stress test: remaining automatic theme switches
 static int64_t g_auto_next = 0;
 
+static void settings_theme();   // night_ui.h
+
 static void set_theme(int idx, bool save = true) {
   const int64_t t0 = esp_timer_get_time();
   g_theme = ((idx % N_THEMES) + N_THEMES) % N_THEMES;
@@ -1297,17 +1302,20 @@ static void set_theme(int idx, bool save = true) {
   show_static();
   const int64_t t2 = esp_timer_get_time();
   apply_dynamic_theme();
+  settings_theme();
   g_dirty_all = true;
   Serial.printf("set_theme: prefs %d ms, static %d ms, dyn %d ms\n", (int)((t1 - t0) / 1000),
                 (int)((t2 - t1) / 1000), (int)((esp_timer_get_time() - t2) / 1000));
 }
 
 static void shows_update(const Now& n);   // shows.h
+static bool night_tick(const Now& n);     // night_ui.h
 
 static void fast_cb(lv_timer_t*) {
   static int last_s = -1;
   static int64_t last_mi = -1, last_d = -1;
   const Now n = now_local();
+  if (night_tick(n)) return;   // the night display replaces the whole clock
 
   // DST can jump local time while UTC remains continuous. Repaint the entire day
   // ring and hands after any discontinuity, not just its old/new endpoint sprites.
@@ -1806,6 +1814,7 @@ static void orient_tick(bool now) {
 // ----------------------------------------------------------------------------------------------
 static constexpr int MIN_BRIGHTNESS = 8;   // never fully black by swiping, so the screen can't be "lost"
 static uint8_t g_bri = BRIGHTNESS;
+static uint8_t g_bri_night = 24;   // backlight for the night display (dragging while it is up adjusts this one)
 static int64_t g_bri_hide_at = 0;
 static lv_obj_t *bri_ui, *bri_lbl, *bri_bar;
 
@@ -1833,15 +1842,16 @@ static void bri_build() {
 
 static void set_brightness(int v, bool show) {
   v = constrain(v, MIN_BRIGHTNESS, 255);
-  const bool changed = v != g_bri;
-  g_bri = (uint8_t)v;
-  if (g_disp_on) M5.Display.setBrightness(g_bri);
+  uint8_t& bri = g_night_on ? g_bri_night : g_bri;
+  const bool changed = v != bri;
+  bri = (uint8_t)v;
+  if (g_disp_on) M5.Display.setBrightness(bri);
   if (show && (changed || lv_obj_has_flag(bri_ui, LV_OBJ_FLAG_HIDDEN))) {
     char b[32];
-    snprintf(b, sizeof(b), "Brightness  %d%%", (g_bri * 100 + 127) / 255);
+    snprintf(b, sizeof(b), g_night_on ? "Night brightness  %d%%" : "Brightness  %d%%", (bri * 100 + 127) / 255);
     lv_label_set_text(bri_lbl, b);
     lv_obj_set_style_bg_color(bri_bar, lv_color_hex(THEMES[g_theme].acc1), LV_PART_INDICATOR);
-    lv_bar_set_value(bri_bar, g_bri, LV_ANIM_OFF);
+    lv_bar_set_value(bri_bar, bri, LV_ANIM_OFF);
     lv_obj_remove_flag(bri_ui, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(bri_ui);
     g_bri_hide_at = 0;  // stays up while adjusting; hidden shortly after the finger lifts
@@ -1877,7 +1887,7 @@ static void display_set(bool on) {
     lv_timer_handler();
     lv_refr_now(g_disp);            // render + flush everything now
     flush_settle();
-    M5.Display.setBrightness(g_bri);
+    M5.Display.setBrightness(g_night_on ? g_bri_night : g_bri);
   } else {
     batt_close();
     lv_timer_pause(g_fast_timer);
@@ -1891,6 +1901,7 @@ static void display_set(bool on) {
 // ----------------------------------------------------------------------------------------------
 #include "tz_ui.h"
 #include "shows.h"
+#include "night_ui.h"
 #include "serial_console.h"
 
 // LVGL pointer input for the WiFi screen (the clock face itself is handled by handle_touch below)
@@ -1905,8 +1916,16 @@ static void touch_read_cb(lv_indev_t*, lv_indev_data_t* d) {
 
 // A confirmed single tap on the clock face.
 static void run_tap(int x, int y) {
+  if (g_night_mode) g_peek_until = mono_ms() + PEEK_MS;   // every tap keeps the normal clock up a while longer
+  if (g_night_on) {   // a tap on the night display reveals the clock; on the gear it opens the settings too
+    if (settings_gear_hit(x, y)) settings_open();
+    lv_timer_ready(g_fast_timer);
+    return;
+  }
   if (g_show_running) { show_stop(); return; }   // a tap ends a show (and does nothing else)
-  if (g_batt_open) {
+  if (g_settings_open) {
+    settings_tap(x, y);
+  } else if (g_batt_open) {
     if (x >= BC_X && x < BC_X + BC_W && y >= BC_Y + 220 && y < BC_Y + 252)
       set_battery_mode(!g_usb_only);
     else if (x >= BC_X && x < BC_X + BC_W && y >= BC_Y + 252 && y < BC_Y + BC_H)
@@ -1918,6 +1937,8 @@ static void run_tap(int x, int y) {
     wifi_open();
   } else if (x >= PX && x < PX + 350 && y < 84) {   // the greeting
     tz_open();
+  } else if (settings_gear_hit(x, y)) {             // the gear in the calendar header
+    settings_open();
   } else if (x >= PX && y < 250) {                  // the big digits
     g_24h = !g_24h;
     prefs.putBool("h24", g_24h);
@@ -1946,7 +1967,7 @@ static void handle_touch() {
   if (pressed && !down) {                           // finger down
     down = true; adjusting = false;
     sx = lx = t.x; sy = ly = t.y;
-    t_down = now; bri0 = g_bri;
+    t_down = now; bri0 = g_night_on ? g_bri_night : g_bri;
   } else if (pressed) {                             // finger moving
     lx = t.x; ly = t.y;
     const int dx = lx - sx, dy = ly - sy;
@@ -1956,9 +1977,10 @@ static void handle_touch() {
     down = false;
     if (adjusting) {
       adjusting = false;
-      prefs.putUChar("bri", g_bri);
+      const uint8_t b = g_night_on ? g_bri_night : g_bri;
+      prefs.putUChar(g_night_on ? "bri_n" : "bri", b);
       g_bri_hide_at = now + 900;
-      Serial.printf("brightness %d (%d%%)\n", g_bri, (g_bri * 100 + 127) / 255);
+      Serial.printf("%sbrightness %d (%d%%)\n", g_night_on ? "night " : "", b, (b * 100 + 127) / 255);
     } else if (abs(lx - sx) <= 40 && abs(ly - sy) <= 40 && now - t_down < 600 && now >= ignore_until) {
       if (!g_disp_on) {                             // any tap wakes a sleeping display
         display_set(true);
@@ -1988,8 +2010,8 @@ void setup() {
   auto cfg = M5.config();
   cfg.output_power = false;   // don't power the 5 V external/USB-host outputs - nothing is plugged in there
   cfg.internal_imu = true;    // accelerometer for auto-rotation (the gyro is switched off again in imu_setup)
-  cfg.internal_mic = false;   // the clock uses neither the microphone nor the speaker/audio codec
-  cfg.internal_spk = false;
+  cfg.internal_mic = false;   // no microphone
+  cfg.internal_spk = true;    // the hourly announcement; only configured here, powered while a clip plays
   M5.begin(cfg);
   imu_setup();
   { const int r = orient_sample(); g_rot = r ? r : ROTATION; }   // start the right way up
@@ -2005,7 +2027,7 @@ void setup() {
   g_24h = prefs.getBool("h24", true);
   g_usb_only = prefs.getBool("batt_usb", false);
   g_charge_limit.enabled = prefs.getBool("chg_lim", true);
-  g_shows_enabled = prefs.getBool("shows", true);
+  settings_load();
   g_bri = (uint8_t)constrain((int)prefs.getUChar("bri", BRIGHTNESS), MIN_BRIGHTNESS, 255);
   M5.Display.setBrightness(g_bri);
 
@@ -2047,6 +2069,7 @@ void setup() {
   bri_build();
   batt_build();
   shows_build();
+  settings_build();
   g_indev = lv_indev_create();
   lv_indev_set_type(g_indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(g_indev, touch_read_cb);
@@ -2071,6 +2094,8 @@ void loop() {
     net_apply();
     const bool rtc_busy = poll_rtc();
     rtc_backup_write();
+    hourly_announce_tick();  // the announcement plays with the display off too
+    announce_tick();
     delay(rtc_busy || g_rtc_write_utc_s ? 4 : 30);
     return;
   }
@@ -2082,6 +2107,8 @@ void loop() {
   handle_serial();      stat_add(st_ser, t); t = esp_timer_get_time();
   bri_tick();
   orient_tick(false);
+  hourly_announce_tick();
+  announce_tick();
   net_apply();
   rtc_backup_write();
   {
