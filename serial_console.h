@@ -154,7 +154,7 @@ static void handle_serial() {
         Serial.printf("display=%d wifi_ui=%d brightness=%u rtc_pending=%lld\n", (int)g_disp_on.load(), (int)g_wifi_open,
                       (unsigned)g_bri, (long long)g_rtc_write_utc_s);
         Serial.printf("ui time=%s | date=%s | month=%s\n", lv_label_get_text(lbl_time), lv_label_get_text(lbl_date), lv_label_get_text(lbl_month));
-        Serial.printf("version=%s ", FIRMWARE_VERSION);
+        Serial.printf("version=%s pie_aurora=%d pie_blends=%d ", FIRMWARE_VERSION, (int)g_pie_aurora, clock_blend_pie(-1));
         Serial.printf("uptime_ms=%lld reset_reason=%d rtc_ready=%d rtc_lost=%d battery_presence=%d usb_only=%d\n", (long long)mono_ms(),
                       (int)esp_reset_reason(), (int)g_rtc_ready, [] { bool l = false; return rtc_time_lost(l) ? (int)l : -1; }(), (int)g_battery_presence.state, (int)g_usb_only);
         Serial.printf("battery: level=%d voltage=%dmV current=%dmA charging=%d external=%d chg_stat=%d charge_limit=%d charge_en=%d chg_en_out=%d chg_en_in=%d\n",
@@ -223,9 +223,14 @@ static void handle_serial() {
         else { Serial.println("ERR usage: L on|off"); break; }
         Serial.printf("OK charge limit %s\n", g_charge_limit.enabled ? "80-90%" : "off");
         break;
-      case 'R': {  // PIE kernels: "R" checks them against C and times both, "R <n>" n stress rounds
+      case 'R': {  // PIE kernels: "R" checks them against C and times both, "R <n>" n stress rounds, "R c|p" blends in C / on PIE
         const int n = atoi(line + 1);
-        if (n > 0) pie_stress(n); else pie_check(true);
+        if (strchr(line, 'c') || strchr(line, 'p')) {
+          const bool on = strchr(line, 'p') && g_pie_blend_ok;
+          clock_blend_pie(on);
+          Serial.printf("OK blends %s\n", on ? "on PIE" : "in C");
+        } else if (n > 0) pie_stress(n);
+        else pie_check(true);
         break;
       }
       case 'I': {  // announcement: "I" now (current hour), "I <h>" hour h, "I c" bell only, "I v <0-255>" volume

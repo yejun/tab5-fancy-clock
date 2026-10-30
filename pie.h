@@ -13,7 +13,10 @@
 #define CLOCK_PIE 0
 #endif
 
+#include "lv_blend.h"   // the PIE versions of LVGL's fill and additive blends (lv_blend.c), checked here too
+
 static bool g_pie_aurora = false;
+static bool g_pie_blend_ok = false;
 
 // ---- aurora: light added to the band, per RGB565 channel, saturating ----
 // For each pixel i: r5 = min(31, r5 + (cr * w >> 11)), g6 = min(63, g6 + (cg2 * w >> 11)), b5 = min(31, b5 + (cb * w >> 11)),
@@ -143,6 +146,17 @@ static void pie_check(bool report) {
   if (report || !ok)
     Serial.printf("pie: aurora kernel %s; %d pixels: C %u cycles, PIE %u cycles (%.1fx)%s\n", ok ? "matches C" : "DIFFERS, using C",
                   PIE_N, (unsigned)c, (unsigned)p, (float)c / (p ? p : 1), ok ? "" : (String(" at pixel ") + first).c_str());
+  int bf = 0;
+  const int bad = clock_blend_check(2000, 0x2545F491u, &bf);
+  g_pie_blend_ok = bad == 0;
+  clock_blend_pie(g_pie_blend_ok);
+  unsigned t[4] = {};
+  clock_blend_time(t);
+  if (report || bad)
+    Serial.printf("pie: blends %s; 1280 pixels, C/PIE cycles: fill %u/%u (%.1fx), additive %u/%u (%.1fx)%s\n",
+                  bad ? "DIFFER, using C" : "match C", t[0], t[1], (float)t[0] / (t[1] ? t[1] : 1), t[2], t[3],
+                  (float)t[2] / (t[3] ? t[3] : 1),
+                  bad ? (String(" (") + ((bf & 3) == 1 ? "fill" : "additive") + " at pixel " + (bf >> 2) + ")").c_str() : "");
 #else
   if (report) Serial.println("pie: not available in this build (plain C)");
 #endif
@@ -160,6 +174,13 @@ static void pie_stress(int rounds) {
     if (r % 500 == 499) vTaskDelay(1);   // (the task watchdog)
   }
   Serial.printf("pie stress: aurora %d of %d rounds differ%s\n", bad, rounds, bad ? (String(", first at pixel ") + first).c_str() : "");
+  int bf = 0, bb = 0;
+  for (int done = 0; done < rounds; done += 500) {   // (yielding for the task watchdog)
+    bb += clock_blend_check(min(500, rounds - done), esp_cpu_get_cycle_count(), bb ? nullptr : &bf);
+    vTaskDelay(1);
+  }
+  Serial.printf("pie stress: blends %d of %d rounds differ%s\n", bb, rounds,
+                bb ? (String(", first: ") + ((bf & 3) == 1 ? "fill" : "additive") + " at pixel " + (bf >> 2)).c_str() : "");
 #else
   (void)rounds;
   Serial.println("pie: not available in this build (plain C)");

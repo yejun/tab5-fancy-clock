@@ -60,10 +60,10 @@ hand holds still while one runs; a tap ends it. Measured on the device while ani
 
 | Show | | fps | worst |
 |---|---|---|---|
-| `sweep` | a sheen crosses the calendar card, a glint with a tail runs round the bezel | 26-27 | 53 ms |
-| `fireworks` | rockets burst into streaking sparks over the dial | 25-26 | 72 ms |
-| `numerals` | the numerals lift off, orbit on a tilted ring in perspective and land again | 18-19 | 82 ms |
-| `flap` | flip-board cards fade in under the digits, which cascade through random digits to the time | 25 | 72 ms |
+| `sweep` | a sheen crosses the calendar card, a glint with a tail runs round the bezel | 27-28 | 77 ms |
+| `fireworks` | rockets burst into streaking sparks over the dial | 26-27 | 72 ms |
+| `numerals` | the numerals lift off, orbit on a tilted ring in perspective and land again | 23 | 75 ms |
+| `flap` | flip-board cards fade in under the digits, which cascade through random digits to the time | 27 | 69 ms |
 | `dialflip` | the dial turns over in 3D to a back face with the time and date, and back | 24 | 62 ms |
 | `aurora` | a curtain of light ripples across the top of the screen | 31-35 | 33 ms |
 
@@ -83,8 +83,11 @@ How they stay fast:
   the 30 ms show tick, so a frame starts as soon as the last one is done: 18 -> 31-35 fps.
 - **LVGL's RGB565 blends are replaced where they were slow**: translucent fills and ARGB sprites go through LVGL's
   custom blend hooks (`lv_blend.h`, `lv_blend.c`: all three channels mixed in one multiply, transparent pixels
-  skipped), and additive blending gets a fast path in a small LVGL patch (`patches/`). Same pixels as before.
-  Numerals 15-16 -> 18-19 fps, flap 19 -> 25, fireworks 22-25 -> 25-26.
+  skipped), and additive blending gets a hook and a fast path in a small LVGL patch (`patches/`). Same pixels as
+  before. Translucent fills and additive blending then run on PIE as well (2.3x and 5.8x the C speed per row; the
+  same start-up check against C, serial `R c` / `R p` switches between them). Numerals 15-16 -> 23 fps, flap
+  19 -> 27, fireworks 22-25 -> 26-27. Plain sprites stay in C: mostly transparent, they gain more from skipping
+  those pixels than from PIE.
 - The **dial flip** is limited by memory, not maths: without its shading and blending a frame still takes 33 of its
   46 ms, so it stays in C.
 - Serial: `O` lists the shows, `O <n>` plays one and prints its frame statistics, `O <n> <t>` holds it at t seconds

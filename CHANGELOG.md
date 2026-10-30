@@ -11,7 +11,9 @@ serial `S` status.
   a fast path for additive blending (`patches/lvgl-9.6.0-additive-rgb565.patch`, applied by `tools/build.sh` to a
   copy of LVGL in `lvgl-patched/`), and the whole build at -O2 instead of -Os. Numerals 15-16 -> 18-19 fps, flap
   19 -> 25, fireworks 22-25 -> 25-26; the CPU while the clock ticks 19.4% -> 17.8%.
-- Serial: `R` (PIE check / stress test), `A 1|3` / `A auto` (force a rotation for testing).
+- Translucent fills and additive blending on PIE (`lv_blend.c`; LVGL patch adds an additive blend hook), checked
+  against C at start-up: numerals 18-19 -> 23 fps, flap 25 -> 27, fireworks 25-26 -> 26-27.
+- Serial: `R` (PIE checks / stress test, `R c|p` blends in C / on PIE), `S` shows the PIE state, `A 1|3` / `A auto` (force a rotation for testing).
 
 ## 1.1.0 - 2026-10-28
 
