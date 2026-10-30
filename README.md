@@ -60,10 +60,10 @@ hand holds still while one runs; a tap ends it. Measured on the device while ani
 
 | Show | | fps | worst |
 |---|---|---|---|
-| `sweep` | a sheen crosses the calendar card, a glint with a tail runs round the bezel | 25-27 | 61 ms |
-| `fireworks` | rockets burst into streaking sparks over the dial | 21-23 | 78 ms |
-| `numerals` | the numerals lift off, orbit on a tilted ring in perspective and land again | 15-16 | 93 ms |
-| `flap` | flip-board cards fade in under the digits, which cascade through random digits to the time | 28-29 | 168 ms |
+| `sweep` | a sheen crosses the calendar card, a glint with a tail runs round the bezel | 26-27 | 53 ms |
+| `fireworks` | rockets burst into streaking sparks over the dial | 25-26 | 72 ms |
+| `numerals` | the numerals lift off, orbit on a tilted ring in perspective and land again | 18-19 | 82 ms |
+| `flap` | flip-board cards fade in under the digits, which cascade through random digits to the time | 25 | 72 ms |
 | `dialflip` | the dial turns over in 3D to a back face with the time and date, and back | 24 | 62 ms |
 | `aurora` | a curtain of light ripples across the top of the screen | 31-35 | 33 ms |
 
@@ -81,13 +81,17 @@ How they stay fast:
   they agree (serial `R` repeats the check, `R <n>` stress-tests). The worker went from 52 to 28 ms a frame (the
   same frame, copied without any maths, takes 17 ms). Core-0 shows also poll their worker every 4 ms instead of on
   the 30 ms show tick, so a frame starts as soon as the last one is done: 18 -> 31-35 fps.
+- **LVGL's RGB565 blends are replaced where they were slow**: translucent fills and ARGB sprites go through LVGL's
+  custom blend hooks (`lv_blend.h`, `lv_blend.c`: all three channels mixed in one multiply, transparent pixels
+  skipped), and additive blending gets a fast path in a small LVGL patch (`patches/`). Same pixels as before.
+  Numerals 15-16 -> 18-19 fps, flap 19 -> 25, fireworks 22-25 -> 25-26.
 - The **dial flip** is limited by memory, not maths: without its shading and blending a frame still takes 33 of its
   46 ms, so it stays in C.
 - Serial: `O` lists the shows, `O <n>` plays one and prints its frame statistics, `O <n> <t>` holds it at t seconds
   (for screenshots), `O x` stops, `O on|off` turns the hourly schedule on or off.
 
 ## Rendering / power
-With the display on, the CPU is busy ~19% of the time (it was ~80% at 27 fps before this pipeline):
+With the display on, the CPU is busy ~18% of the time (it was ~80% at 27 fps before this pipeline):
 - **Static artwork** per theme is rendered once into an RGB565 image: the smooth background and radial dial parts are
   painted per pixel in float (the other themes on core 0 in the background after boot), LVGL draws the crisp details
   on top in 32 bit, then it is dithered (4x4 Bayer) to RGB565.
@@ -97,6 +101,8 @@ With the display on, the CPU is busy ~19% of the time (it was ~80% at 27 fps bef
 - **Flush**: the rotation into the panel's portrait frame buffer is done by the P4's PPA (DMA), not the CPU, and
   asynchronously: LVGL renders the next strip while the PPA rotates the previous one (a full-dial redraw went from 15
   to 20 fps). `H 16` switches back to blocking flushes for comparison.
+- **Draw buffers stay in PSRAM**: PPA rotations of 16-32-line strips in internal RAM were faster (45 vs 105 us per
+  1000 pixels) but sometimes never completed, which stalls the clock.
 - **Idle**: `loop()` sleeps until LVGL's next timer is due and polls touch every 25 ms; LVGL's own touch input is only
   polled while the WiFi screen is open.
 - `S` prints `cpu busy N% | fps` since the previous `S`. Note newlib's float trig goes through soft double on the P4,

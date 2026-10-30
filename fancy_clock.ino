@@ -206,7 +206,8 @@ static bool g_screenshot_active = false;
 static void log_cb(lv_log_level_t, const char* msg) { if (!g_screenshot_active) Serial.print(msg); }
 
 // The ESP-Hosted driver for the WiFi chip needs a big chunk of *internal* RAM for its SDIO buffer pool,
-// so the LVGL draw buffers live in PSRAM (internal RAM is the scarce resource here).
+// so the LVGL draw buffers live in PSRAM (internal RAM is the scarce resource here). Internal RAM would also be
+// unsafe: PPA rotations reading 16-32-line strips from internal RAM sometimes never completed (tried 2026-10-30).
 static void* alloc_draw_buf(size_t bytes) {
   void* p = heap_caps_aligned_alloc(128, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);  // cache-line aligned for the PPA
   if (!p) p = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -370,7 +371,7 @@ static void d_sprite(lv_layer_t* L, const lv_draw_buf_t* spr, float cx, float cy
 // ----------------------------------------------------------------------------------------------
 static lv_draw_buf_t *spr_tip, *spr_hub, *spr_knob, *spr_head;
 
-#define HOT __attribute__((optimize("O2")))   // for the per-pixel loops (the sketch is otherwise built with -Os)
+#define HOT __attribute__((optimize("O2")))   // for the per-pixel loops (tools/build.sh builds with -O2; this keeps them fast under -Os)
 static inline float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 static inline float smooth(float e0, float e1, float v) { const float t = clamp01((v - e0) / (e1 - e0)); return t * t * (3 - 2 * t); }
 static inline float disc_cov(float d, float r) { return clamp01(r - d + 0.5f); }                         // AA disc

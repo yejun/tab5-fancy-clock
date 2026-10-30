@@ -1,0 +1,26 @@
+--- a/src/draw/sw/blend/lv_draw_sw_blend_to_rgb565.c
++++ b/src/draw/sw/blend/lv_draw_sw_blend_to_rgb565.c
+@@ -1357,6 +1357,23 @@
+             }
+         }
+     }
++    else if(dsc->blend_mode == LV_BLEND_MODE_ADDITIVE && mask_buf == NULL) {
++        /*Fast path: same result as the generic loop below, but transparent pixels are skipped
++         *and the blend mode isn't re-checked for every pixel*/
++        for(y = 0; y < h; y++) {
++            for(dest_x = 0, src_x = 0; dest_x < w; dest_x++, src_x += 4) {
++                const uint32_t a = opa >= LV_OPA_MAX ? src_buf_u8[src_x + 3] : LV_OPA_MIX2(opa, src_buf_u8[src_x + 3]);
++                if(a == 0) continue;
++                const uint32_t d = dest_buf_u16[dest_x];
++                uint32_t r = (d >> 11) + (src_buf_u8[src_x + 2] >> 3), g = ((d >> 5) & 63) + (src_buf_u8[src_x + 1] >> 2),
++                         b = (d & 31) + (src_buf_u8[src_x + 0] >> 3);
++                const uint16_t res = (uint16_t)((r > 31 ? 31 : r) << 11 | (g > 63 ? 63 : g) << 5 | (b > 31 ? 31 : b));
++                dest_buf_u16[dest_x] = a >= LV_OPA_MAX ? res : lv_color_16_16_mix_inlined(res, (uint16_t)d, (uint8_t)a);
++            }
++            dest_buf_u16 = drawbuf_next_row(dest_buf_u16, dest_stride);
++            src_buf_u8 += src_stride;
++        }
++    }
+     else {
+         uint16_t res = 0;
+         for(y = 0; y < h; y++) {

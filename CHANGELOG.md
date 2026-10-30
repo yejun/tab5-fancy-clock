@@ -7,6 +7,10 @@ serial `S` status.
 
 - Aurora show: its per-pixel light on the P4's SIMD unit (PIE, `pie.h`, checked against the C version at start-up),
   and core-0 shows start each frame as soon as the last one is done: aurora 18 -> 31-35 fps.
+- Faster LVGL drawing, same pixels: custom RGB565 blend hooks for translucent fills and sprites (`lv_blend.c`),
+  a fast path for additive blending (`patches/lvgl-9.6.0-additive-rgb565.patch`, applied by `tools/build.sh` to a
+  copy of LVGL in `lvgl-patched/`), and the whole build at -O2 instead of -Os. Numerals 15-16 -> 18-19 fps, flap
+  19 -> 25, fireworks 22-25 -> 25-26; the CPU while the clock ticks 19.4% -> 17.8%.
 - Serial: `R` (PIE check / stress test), `A 1|3` / `A auto` (force a rotation for testing).
 
 ## 1.1.0 - 2026-10-28
