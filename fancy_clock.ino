@@ -59,6 +59,7 @@ static const Theme THEMES[] = {
   {"OCEAN",    0x031526, 0x07405F, 0x40CFF4, 0xFFB26B, 0x6F8CFF, 0xE8F3FF},
   {"JADE",     0x05201A, 0x0F3D2E, 0x7BE495, 0xFFC857, 0x3CC3CC, 0xEEF7EE},
   {"GRAPHITE", 0x0C0E13, 0x20242E, 0x5AC8FA, 0xFF5A4F, 0xFFB340, 0xF1F3F7},
+  {"HOLIDAY",  0x040B1E, 0x0E2A40, 0xFFCC66, 0xFF4D5E, 0x45C99A, 0xF3F7FF, 1},   // snowy pines, star, bauble
 };
 static constexpr int N_THEMES = sizeof(THEMES) / sizeof(THEMES[0]);
 
@@ -84,6 +85,7 @@ static lv_display_t* g_disp = nullptr;
 static uint32_t g_flush_us = 0, g_flush_px = 0, g_flush_n = 0, g_frames = 0;
 static int64_t  g_busy_us = 0, g_stat_t0 = 0;   // time loop() spent working (not sleeping) since the last "S"
 static bool g_show_running = false;       // a show is on: the second hand holds still (less to redraw, less to look at)
+static bool g_show_live_clock = false;   // ...unless the show keeps the clock going (snowfall)
 static bool g_show_owns_dial = false;     // a show draws the dial straight into the frame buffer: LVGL keeps out
 static bool     g_frame_track = false;            // per-frame timing while a show runs (see shows.h)
 static int64_t  g_frame_last_us = 0, g_frame_worst_us = 0;
@@ -513,6 +515,8 @@ static void d_capsules(lv_layer_t* L, const CapsuleImg& ci) {
   lv_draw_image(L, &d, &ci.area);
 }
 
+static Rgba holiday_hub(const Theme& th, float dx, float dy);   // holiday.h
+
 static HOT void make_sprites(const Theme& th) {
   // Second hand tip: a translucent coloured lens with a bright rim, a soft halo and a small specular highlight
   lv_draw_buf_t* b = sprite_begin(spr_tip, 64);
@@ -533,6 +537,7 @@ static HOT void make_sprites(const Theme& th) {
   for (int y = 0; y < 72; y++)
     for (int x = 0; x < 72; x++) {
       const float dx = x - 35.5f, dy = y - 35.5f, d = sqrtf(dx * dx + dy * dy);
+      if (th.scene == 1) { sprite_put(b, x, y, holiday_hub(th, dx, dy)); continue; }
       const float sx = dx - 2, sy = dy - 6, sd = sqrtf(sx * sx + sy * sy);
       const float jx = dx + 2.2f, jy = dy + 2.4f;
       Rgba p = {0, 0, 0, 0};
@@ -598,6 +603,8 @@ static inline float fast_atan2f(float y, float x) {   // |error| < 1e-5 rad
   if (x < 0) r = 3.14159274f - r;
   return y < 0 ? -r : r;
 }
+
+#include "holiday.h"
 
 static HOT void sky_at(const Theme& th, const Glow* glows, const Ribbon* ribs, const RibbonCol* rc2, float x, float y, float* c) {
   const Rgba top = rgba(th.bg_top, 1), bot = rgba(th.bg_bot, 1);
@@ -668,6 +675,7 @@ static HOT void dial_at(const DialCols& dc, float x, float y, float* c, bool sha
   } else if (a > 0) {
     mix_to(c, ink, a);
   }
+  if (dc.scene == 1) hol_marks_at(dc, x, y, d, c);
 }
 
 // Runs on the UI thread for the first theme and in paint_task (core 0) for the others: no LVGL calls in here.
@@ -681,12 +689,14 @@ static HOT void paint_region(uint32_t* data, int stride_px, const Theme& th, int
   };
   const Ribbon ribs[2] = {
     // y0    slope   a1  k1       p1    a2  k2      p2    w   amp    k3      p3
-    {585, -0.36f, 44, 0.0041f, 0.6f, 16, 0.011f, 2.0f, 64, 0.16f, 0.047f, 0.3f, th.acc1},
-    {300, -0.20f, 56, 0.0030f, 2.4f, 20, 0.009f, 0.7f, 54, 0.11f, 0.061f, 1.1f, th.acc3},
+    {585, -0.36f, 44, 0.0041f, 0.6f, 16, 0.011f, 2.0f, 64, 0.16f, 0.047f, 0.3f, th.scene ? th.acc3 : th.acc1},
+    {300, -0.20f, 56, 0.0030f, 2.4f, 20, 0.009f, 0.7f, 54, 0.11f, 0.061f, 1.1f, th.scene ? 0x4F8FE0u : th.acc3},   // holiday: green and icy blue aurora
   };
   DialCols dc;
-  const Rgba ik = rgba(th.ink, 1), a3 = rgba(th.acc3, 1);
+  const Rgba ik = rgba(th.ink, 1), a1 = rgba(th.acc1, 1), a3 = rgba(th.acc3, 1);
   dc.ink[0] = ik.r; dc.ink[1] = ik.g; dc.ink[2] = ik.b;
+  dc.acc1[0] = a1.r; dc.acc1[1] = a1.g; dc.acc1[2] = a1.b;
+  dc.scene = th.scene;
   dc.acc3[0] = a3.r; dc.acc3[1] = a3.g; dc.acc3[2] = a3.b;
   constexpr int S = 4;
   const int GW = w / S + 2, GH = h / S + 2;
@@ -720,6 +730,7 @@ static HOT void paint_region(uint32_t* data, int stride_px, const Theme& th, int
         c[k] = a + (b - a) * fy;
       }
       const int sx = x0 + x, sy = y0 + y;
+      if (th.scene == 1) hol_scene_at(sx, sy, c);
       if (dial && sx < CX + 346 && sy > CY - 346 && sy < CY + 346) dial_at(dc, sx, sy, c, dial == 1);
       out[x] = 0xFF000000u | ((uint32_t)(clamp01(c[0]) * 255 + 0.5f) << 16) |
                ((uint32_t)(clamp01(c[1]) * 255 + 0.5f) << 8) | (uint32_t)(clamp01(c[2]) * 255 + 0.5f);
@@ -733,7 +744,7 @@ static void paint_background(uint32_t* data, int stride_px, const Theme& th) { p
 static void bokeh_draw_cb(lv_event_t* e) {
   lv_layer_t* L = lv_event_get_layer(e);
   const Theme& th = THEMES[g_render_theme];
-  const uint32_t cols[3] = {th.acc1, th.acc2, th.acc3};
+  const uint32_t cols[3] = {th.scene ? th.ink : th.acc1, th.scene ? th.ink : th.acc2, th.scene ? th.ink : th.acc3};   // holiday: big soft snowflakes
   uint32_t seed = 0x2545F491u;
   auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) / 16777216.0f; };
   for (int i = 0, n = 0; i < 200 && n < 16; i++) {
@@ -753,7 +764,7 @@ static void dial_deco_cb(lv_event_t* e) {
   for (int i = 0; i < 60; i++) d_polar(L, i * 6.0f, 121, i % 5 ? 126 : 129, 1, th.ink, i % 5 ? 36 : 80);
   for (int i = 0; i < 240; i++) if (i % 4) d_polar(L, i * 1.5f, 282, 288, 1, th.ink, 48);
   for (int i = 0; i < 60; i++) if (i % 5) d_polar(L, i * 6.0f, 268, 288, 2, th.ink, 120);
-  for (int i = 0; i < 12; i++) {
+  for (int i = 0; i < 12 && !th.scene; i++) {            // (the holiday theme paints a star and snowflakes instead)
     const int n = i == 0 ? 2 : 1;                        // doubled index at 12 o'clock
     for (int k = 0; k < n; k++) {
       const float off = n == 2 ? (k ? 6.5f : -6.5f) : 0;
@@ -1450,7 +1461,7 @@ static void fast_cb(lv_timer_t*) {
     g_comp_full = true;
     lv_obj_invalidate(secbar_obj);
   }
-  if (!g_show_running || force) set_seconds(n.s + n.ms / 1000.0f, force);
+  if (!g_show_running || g_show_live_clock || force) set_seconds(n.s + n.ms / 1000.0f, force);
   if (n.s != last_s) {
     last_s = n.s;
     // The hour/minute hands move well under a pixel per second: step the minute hand every 3 s and the hour
@@ -1896,6 +1907,28 @@ static void imu_setup() {
       M5.In_I2C.writeRegister8(a, 0x7D, 0x04, 400000);       // PWR_CTRL: accelerometer only
 }
 
+// Shake to make it snow (HOLIDAY theme only), from the same accelerometer samples (no extra reads: each costs two
+// I2C transfers, and polling fast enough for shakes cost ~0.5% CPU). One back-and-forth is enough: two samples within
+// SHAKE_MS that each moved - |a| more than SHAKE_G away from 1 g, or a change of more than SHAKE_DG since the last
+// sample (a swing turns the vector even when it is gentle; tilting the Tab5 slowly changes it far less per 200 ms).
+static constexpr int SHAKE_MS = 1000;
+static constexpr float SHAKE_G = 0.3f, SHAKE_DG = 0.35f;
+static void snow_from_shake();   // shows.h
+
+static void shake_sample(const float* a) {
+  static float last[3] = {0, 0, 0};
+  static int64_t hit_at = -SHAKE_MS;
+  const float dx = a[0] - last[0], dy = a[1] - last[1], dz = a[2] - last[2];
+  const bool had = last[0] || last[1] || last[2];
+  last[0] = a[0]; last[1] = a[1]; last[2] = a[2];
+  if (!THEMES[g_theme].scene || g_night_on || !had) return;
+  const float mag = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+  if (fabsf(mag - 1) < SHAKE_G && dx * dx + dy * dy + dz * dz < SHAKE_DG * SHAKE_DG) return;
+  const int64_t t = mono_ms();
+  if (t - hit_at < SHAKE_MS) { hit_at = -SHAKE_MS; snow_from_shake(); }
+  else hit_at = t;
+}
+
 // The rotation the accelerometer asks for: 1 or 3, or 0 if undecided.
 static int orient_sample() {
   if (!g_imu_ok) return 0;
@@ -1903,6 +1936,7 @@ static int orient_sample() {
   M5.Imu.getAccel(&a[0], &a[1], &a[2]);
   const float g = ORIENT_SIGN * a[ORIENT_AXIS], side = fabsf(a[1 - ORIENT_AXIS]);
   const float mag2 = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
+  shake_sample(a);
   if (mag2 < 0.7f * 0.7f || mag2 > 1.3f * 1.3f) return 0;   // being moved
   if (fabsf(g) < ORIENT_MIN_G || fabsf(g) < 1.5f * side) return 0;
   return g > 0 ? 1 : 3;

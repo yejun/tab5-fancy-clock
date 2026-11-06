@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 // Hourly shows: short animations layered over the clock. Each draws through a full-screen overlay object above
 // the clock widgets (hidden, so free, between shows) and invalidates only the areas it touches. While a show
 // runs, fast_cb is called every SHOW_FRAME_MS; the frame rate is then limited by rendering + flushing.
@@ -1239,6 +1240,227 @@ static void aurora_end() {
   g_au_ok = false;
 }
 
+// ----------------------------------------------------------------------------------------------
+// 8. Snowfall: shake the Tab5 in the HOLIDAY theme (shake_sample) and soft flakes at three depths (and a few crystals)
+// drift down with a little sway in a slow wind, while the clock keeps running; snow settles on top of the dial's
+// bezel and the calendar card, melting away again at the end. Only the screen tiles flakes pass through are redrawn.
+// ----------------------------------------------------------------------------------------------
+static constexpr float SNOW_T = 20;
+static constexpr int N_FLAKES = 70;   // ~15 fps with the second hand moving; 120 ran at 12 (every flake's tiles are redrawn)
+struct Flake { float x, y, vy, sway, ph, freq, lx, ly; uint8_t kind; };
+static Flake* g_flakes = nullptr;                      // in PSRAM while the show runs
+static lv_draw_buf_t* g_flake_spr[4] = {};             // soft discs far / middle / near, and a crystal
+static float g_snow_env = 0, g_snow_cap = 0, g_snow_last_t = 0;
+static int g_snow_cap_q = 0;
+static lv_draw_buf_t *g_snow_dial = nullptr, *g_snow_card = nullptr;   // the settled snow, re-rendered as it grows
+static constexpr float SNOW_DEPTH[4] = {0.55f, 0.8f, 1.15f, 0.95f};   // wind and sway scale with nearness
+
+static void snow_sprites() {
+  static const float R[3] = {1.3f, 2.1f, 3.2f}, A[3] = {0.55f, 0.75f, 0.92f};
+  for (int k = 0; k < 3; k++) {
+    const int size = 2 * (int)ceilf(R[k] + 2.5f) + 1;
+    lv_draw_buf_t* b = sprite_begin(g_flake_spr[k], size);
+    const float c = (size - 1) / 2.0f;
+    for (int y = 0; y < size; y++)
+      for (int x = 0; x < size; x++) {
+        const float dx = x - c, dy = y - c, d = sqrtf(dx * dx + dy * dy);
+        Rgba p = rgba(0xF4F8FF, 0.25f * A[k] * expf(-d * d / (2 * R[k] * R[k])));   // a soft halo
+        over(p, rgba(0xFFFFFF, A[k] * disc_cov(d, R[k])));
+        sprite_put(b, x, y, p);
+      }
+  }
+  lv_draw_buf_t* b = sprite_begin(g_flake_spr[3], 21);   // crystal: 6 arms with branches, like the dial's marks
+  for (int y = 0; y < 21; y++)
+    for (int x = 0; x < 21; x++) {
+      const float px = x - 10, py = y - 10, rr = 8;
+      float dmin = 1e9f;
+      for (int j = 0; j < 6; j++) {
+        const float ux = hol_sin(2 * j + 1), uy = -hol_cos(2 * j + 1);
+        dmin = fminf(dmin, hol_seg(px, py, 0, 0, ux * rr, uy * rr));
+        for (int sgn = -2; sgn <= 2; sgn += 4)
+          dmin = fminf(dmin, hol_seg(px, py, ux * rr * 0.55f, uy * rr * 0.55f, ux * rr * 0.55f + hol_sin(2 * j + 1 + sgn) * rr * 0.35f,
+                                     uy * rr * 0.55f - hol_cos(2 * j + 1 + sgn) * rr * 0.35f));
+      }
+      Rgba p = rgba(0xF4F8FF, 0.18f * expf(-(px * px + py * py) / 30));
+      over(p, rgba(0xFFFFFF, 0.92f * clamp01(1.3f - dmin)));
+      sprite_put(b, x, y, p);
+    }
+}
+
+static void snow_spawn(Flake& f, bool anywhere, int kind = -1) {   // kind: keep it (the array stays sorted by depth)
+  const float r = frand();
+  f.kind = kind >= 0 ? kind : r < 0.45f ? 0 : r < 0.75f ? 1 : r < 0.93f ? 2 : 3;
+  static const float V0[4] = {26, 38, 55, 44}, V1[4] = {38, 52, 74, 58};
+  f.vy = V0[f.kind] + (V1[f.kind] - V0[f.kind]) * frand();
+  f.sway = (5 + 12 * frand()) * SNOW_DEPTH[f.kind];
+  f.ph = frand() * 4;
+  f.freq = 0.25f + 0.35f * frand();   // hol_wave periods per second (one period = 4 units)
+  f.x = -80 + frand() * (SCR_W + 80);
+  f.y = anywhere ? -20 + frand() * (SCR_H + 20) : -14 - frand() * 30;
+  f.lx = f.ly = -1e9f;
+}
+
+// screen areas the settled snow occupies
+static constexpr lv_area_t SNOW_DIAL_BOX = {CX - 262, CY - 314, CX + 261, CY - 166};
+static constexpr lv_area_t SNOW_CARD_BOX = {CARD_X, CARD_Y - 10, CARD_X + CARD_W - 1, CARD_Y + 14};
+static constexpr float SNOW_CARD_R = 28;   // the card's corner radius
+static constexpr float SNOW_BEZEL = 303;   // the bezel's outer edge
+static constexpr float SNOW_ARC = 56;      // degrees either side of 12 o'clock
+
+// Settled snow h px deep at most: a lumpy layer on the bezel tapering towards its ends, and a ridge on the card
+static HOT void snow_caps_render(float h) {
+  const float w[3] = {0.93f, 0.96f, 1.0f};
+  if (g_snow_dial) {
+    lv_image_cache_drop(g_snow_dial);
+    const int W = g_snow_dial->header.w, H = g_snow_dial->header.h;
+    const float r1 = SNOW_BEZEL - 1.5f, r2 = SNOW_BEZEL + 8;
+    for (int y = 0; y < H; y++) {
+      uint32_t* row = (uint32_t*)((uint8_t*)g_snow_dial->data + y * g_snow_dial->header.stride);
+      const float dy = SNOW_DIAL_BOX.y1 + y - CY, dy2 = dy * dy;
+      if (dy2 > r2 * r2) continue;
+      const float xo = sqrtf(r2 * r2 - dy2), xi = dy2 < r1 * r1 ? sqrtf(r1 * r1 - dy2) : 0;
+      for (int side = -1; side <= 1; side += 2) {
+        const int xa = max(0, (int)floorf(side < 0 ? CX - xo : CX + xi) - (int)SNOW_DIAL_BOX.x1);
+        const int xb = min(W - 1, (int)ceilf(side < 0 ? CX - xi : CX + xo) - (int)SNOW_DIAL_BOX.x1);
+        for (int x = xa; x <= xb; x++) {
+          const float dx = SNOW_DIAL_BOX.x1 + x - CX, r = sqrtf(dx * dx + dy2);
+          const float deg = fast_atan2f(dx, -dy) * (180 / (float)M_PI), u = fabsf(deg) / SNOW_ARC;
+          float a = 0;
+          if (u < 1) {
+            const float depth = h * sqrtf(1 - u * u) * (0.82f + 0.12f * hol_wave(deg * 0.21f) + 0.06f * hol_wave(deg * 0.57f + 1));
+            a = clamp01(SNOW_BEZEL + depth - r + 0.5f) * clamp01(r - (SNOW_BEZEL - 1) + 0.5f);
+          }
+          const float shade = 0.86f + 0.14f * clamp01((r - SNOW_BEZEL) / fmaxf(1, h));   // a little bluer underneath
+          row[x] = a > 0 ? ((uint32_t)(a * 255 + 0.5f) << 24) | ((uint32_t)(w[0] * shade * 255) << 16) |
+                               ((uint32_t)(w[1] * shade * 255) << 8) | (uint32_t)(w[2] * 255)
+                         : 0;
+        }
+      }
+    }
+  }
+  if (g_snow_card) {   // on the card's top edge, following it round the corners and thinning as they steepen
+    lv_image_cache_drop(g_snow_card);
+    const int W = g_snow_card->header.w, H = g_snow_card->header.h;
+    constexpr float R = SNOW_CARD_R;
+    for (int x = 0; x < W; x++) {
+      const float px = SNOW_CARD_BOX.x1 + x + 0.5f, e = fminf(px - CARD_X, CARD_X + CARD_W - px);   // in from the side
+      float edge = CARD_Y, up = 1;                     // the card's top edge here, and how level it is (1 = flat)
+      if (e < R) {
+        const float q = R - e, ny = sqrtf(fmaxf(0, R * R - q * q));
+        edge = CARD_Y + R - ny;
+        up = ny / R;
+      }
+      const float lump = 0.82f + 0.12f * hol_wave(x * 0.043f) + 0.06f * hol_wave(x * 0.13f + 2);
+      const float bot = edge + 1, top = bot - (1 + h * lump) * up * up * up * up;   // from just over the border up
+      for (int y = 0; y < H; y++) {
+        const float sy = SNOW_CARD_BOX.y1 + y, a = clamp01(fminf(sy + 1, bot) - fmaxf(sy, top));   // exact vertical AA
+        const float shade = 0.86f + 0.14f * clamp01((sy + 0.5f - top) / fmaxf(1, bot - top));
+        uint32_t* o = (uint32_t*)((uint8_t*)g_snow_card->data + y * g_snow_card->header.stride) + x;
+        *o = a > 0.004f ? ((uint32_t)(a * 255 + 0.5f) << 24) | ((uint32_t)(w[0] * shade * 255) << 16) |
+                              ((uint32_t)(w[1] * shade * 255) << 8) | (uint32_t)(w[2] * 255)
+                        : 0;
+      }
+    }
+  }
+}
+
+static void snowfall_begin() {
+  if (!g_flakes) g_flakes = (Flake*)heap_caps_malloc(sizeof(Flake) * N_FLAKES, MALLOC_CAP_SPIRAM);
+  if (!g_flakes) return;
+  snow_sprites();
+  g_snow_dial = lv_draw_buf_create(lv_area_get_width(&SNOW_DIAL_BOX), lv_area_get_height(&SNOW_DIAL_BOX), LV_COLOR_FORMAT_ARGB8888, 0);
+  g_snow_card = lv_draw_buf_create(lv_area_get_width(&SNOW_CARD_BOX), lv_area_get_height(&SNOW_CARD_BOX), LV_COLOR_FORMAT_ARGB8888, 0);
+  if (g_snow_dial) lv_draw_buf_clear(g_snow_dial, nullptr);
+  if (g_snow_card) lv_draw_buf_clear(g_snow_card, nullptr);
+  for (int i = 0; i < N_FLAKES; i++) snow_spawn(g_flakes[i], true);
+  std::sort(g_flakes, g_flakes + N_FLAKES, [](const Flake& a, const Flake& b) { return a.kind < b.kind; });   // far ones first
+  g_snow_env = g_snow_cap = g_snow_last_t = 0;
+  g_snow_cap_q = 0;
+  g_show_live_clock = true;   // the second hand keeps sweeping (show_stop clears this)
+}
+
+static inline float snow_x(const Flake& f, float t) { return f.x + f.sway * hol_wave(f.ph + t * f.freq * 4); }
+
+
+static void snowfall_tick(float t) {
+  if (!g_flakes) return;
+  const float dt = fmaxf(0, fminf(0.1f, t - g_snow_last_t));
+  g_snow_last_t = t;
+  g_snow_env = ease(t / 1.5f) * ease((SNOW_T - t) / 1.5f);
+  // settled snow: grows from 2 s to 12 s, melts in the last 2.6 s
+  g_snow_cap = 6.0f * ease((t - 2) / 10) * (1 - ease((t - (SNOW_T - 2.6f)) / 2.2f));
+  const int q = (int)(g_snow_cap * 4);
+  if (q != g_snow_cap_q) {
+    g_snow_cap_q = q;
+    snow_caps_render(q / 4.0f);
+    lv_inv_area(g_disp, &SNOW_DIAL_BOX);
+    lv_inv_area(g_disp, &SNOW_CARD_BOX);
+  }
+  // flakes: move them, then redraw the tiles where each one was and is now
+  constexpr int TW = 40, TH = 40, NTX = SCR_W / TW, NTY = SCR_H / TH;   // small tiles beat fewer, bigger areas
+  static_assert(NTX <= 32 && NTX * TW == SCR_W && NTY * TH == SCR_H, "tiles must cover the screen");
+  uint32_t rows[NTY] = {};   // one bit per tile column
+  auto mark = [&](float x1, float y1, float x2, float y2) {
+    const int tx1 = max(0, (int)floorf(x1) / TW), tx2 = min(NTX - 1, (int)ceilf(x2) / TW);
+    const int ty1 = max(0, (int)floorf(y1) / TH), ty2 = min(NTY - 1, (int)ceilf(y2) / TH);
+    if (x2 < 0 || y2 < 0 || x1 >= SCR_W || y1 >= SCR_H) return;
+    for (int ty = ty1; ty <= ty2; ty++)
+      for (int tx = tx1; tx <= tx2; tx++) rows[ty] |= 1u << tx;
+  };
+  const float wind = 16 + 12 * hol_wave(t * 0.6f);
+  for (int i = 0; i < N_FLAKES; i++) {
+    Flake& f = g_flakes[i];
+    f.y += f.vy * dt;
+    f.x += wind * SNOW_DEPTH[f.kind] * dt;
+    if (f.y > SCR_H + 14 && t < SNOW_T - 4) { const float lx = f.lx, ly = f.ly; snow_spawn(f, false, f.kind); f.lx = lx; f.ly = ly; }
+    const float h = g_flake_spr[f.kind]->header.w / 2.0f + 1, x = snow_x(f, t);
+    if (f.lx > -1e8f) mark(f.lx - h, f.ly - h, f.lx + h, f.ly + h);
+    mark(x - h, f.y - h, x + h, f.y + h);
+    f.lx = x; f.ly = f.y;
+  }
+  // tiles -> rectangles: runs along each row, extended down while the next rows have the same run
+  static lv_area_t boxes[NTX * NTY];
+  int nb = 0;
+  for (int ty = 0; ty < NTY; ty++)
+    while (rows[ty]) {
+      const int tx1 = __builtin_ctz(rows[ty]);
+      int tx2 = tx1;
+      while (tx2 + 1 < NTX && (rows[ty] >> (tx2 + 1) & 1)) tx2++;
+      const uint32_t run = (uint32_t)((((uint64_t)1 << (tx2 + 1)) - 1) & ~((1u << tx1) - 1));
+      int ty2 = ty;
+      while (ty2 + 1 < NTY && (rows[ty2 + 1] & run) == run) ty2++;
+      for (int y = ty; y <= ty2; y++) rows[y] &= ~run;
+      boxes[nb++] = {tx1 * TW, ty * TH, (tx2 + 1) * TW - 1, (ty2 + 1) * TH - 1};
+    }
+  if (nb > 120) { lv_obj_invalidate(show_obj); return; }   // LVGL keeps 128 areas (lv_conf.h), then redraws everything
+  for (int i = 0; i < nb; i++) lv_inv_area(g_disp, &boxes[i]);
+}
+
+static void snowfall_draw(lv_layer_t* L) {
+  if (!g_flakes) return;
+  if (g_snow_cap_q > 0) {
+    if (g_snow_dial && clip_hit_xy(L, SNOW_DIAL_BOX.x1, SNOW_DIAL_BOX.y1, SNOW_DIAL_BOX.x2, SNOW_DIAL_BOX.y2))
+      show_image(L, g_snow_dial, SNOW_DIAL_BOX.x1, SNOW_DIAL_BOX.y1, LV_OPA_COVER);
+    if (g_snow_card && clip_hit_xy(L, SNOW_CARD_BOX.x1, SNOW_CARD_BOX.y1, SNOW_CARD_BOX.x2, SNOW_CARD_BOX.y2))
+      show_image(L, g_snow_card, SNOW_CARD_BOX.x1, SNOW_CARD_BOX.y1, LV_OPA_COVER);
+  }
+  const lv_opa_t opa = (lv_opa_t)(255 * g_snow_env);
+  if (opa < 4) return;
+  for (int i = 0; i < N_FLAKES; i++) {
+    const Flake& f = g_flakes[i];
+    const lv_draw_buf_t* b = g_flake_spr[f.kind];
+    const float hw = b->header.w / 2.0f;
+    if (clip_hit_xy(L, f.lx - hw, f.ly - hw, f.lx + hw, f.ly + hw)) show_image(L, b, f.lx - (b->header.w - 1) / 2.0f, f.ly - (b->header.h - 1) / 2.0f, opa);
+  }
+}
+
+static void snowfall_end() {
+  heap_caps_free(g_flakes);
+  g_flakes = nullptr;
+  for (lv_draw_buf_t*& b : g_flake_spr) if (b) { lv_draw_buf_destroy(b); b = nullptr; }
+  for (lv_draw_buf_t** b : {&g_snow_dial, &g_snow_card}) if (*b) { lv_draw_buf_destroy(*b); *b = nullptr; }
+}
+
 static const ShowDef SHOWS[] = {
   {"bench", 6000, nullptr, bench_tick, nullptr, nullptr},
   {"sweep", 4100, sweep_begin, sweep_tick, sweep_draw, nullptr},
@@ -1247,9 +1469,11 @@ static const ShowDef SHOWS[] = {
   {"flap", (int)(FLAP_T * 1000), flap_begin, flap_tick, flap_draw, flap_end},
   {"dialflip", (int)(DF_ANIM * 1000) + 1800, dialflip_begin, dialflip_tick, dialflip_draw, dialflip_end},
   {"aurora", (int)(AU_T * 1000) + 300, aurora_begin, aurora_tick, aurora_draw, aurora_end},
+  {"snowfall", (int)(SNOW_T * 1000), snowfall_begin, snowfall_tick, snowfall_draw, snowfall_end},   // keep last: SNOW_SHOW
 };
 static constexpr int N_SHOWS = sizeof(SHOWS) / sizeof(SHOWS[0]);
 static constexpr int FIRST_REAL_SHOW = 1;   // index 0 is the benchmark, never picked by the hourly schedule
+static constexpr int SNOW_SHOW = N_SHOWS - 1;   // not on the hour: shaking the Tab5 in the HOLIDAY theme starts it
 
 static void show_draw_cb(lv_event_t* e) {
   if (g_show >= 0 && SHOWS[g_show].draw) SHOWS[g_show].draw(lv_event_get_layer(e));
@@ -1280,6 +1504,7 @@ static void show_stop() {
   if (s.end) s.end();
   g_show = -1;
   g_show_running = false;
+  g_show_live_clock = false;
   g_show_freeze = -1;
   g_frame_track = false;
   lv_timer_set_period(g_fast_timer, FRAME_MS);
@@ -1308,6 +1533,12 @@ static void show_start(int idx) {
   Serial.printf("show %s started\n", SHOWS[idx].name);
 }
 
+static void snow_from_shake() {
+  if (g_show >= 0) return;
+  Serial.println("shake: snowfall");
+  show_start(SNOW_SHOW);
+}
+
 // Called from fast_cb every frame, before the composite is applied.
 static void shows_update(const Now& n) {
   if (g_show >= 0) {
@@ -1325,5 +1556,5 @@ static void shows_update(const Now& n) {
   if (!hourly_allowed(g_shows_enabled, g_night_mode, n.h) || N_SHOWS <= FIRST_REAL_SHOW) return;
   g_show_last_hour = n.h;
   if (g_batt_open || g_wifi_open || g_tz_open || g_settings_open) return;   // don't pull a card away from someone reading it: skip this hour
-  show_start(FIRST_REAL_SHOW + (int)(esp_random() % (N_SHOWS - FIRST_REAL_SHOW)));
+  show_start(FIRST_REAL_SHOW + (int)(esp_random() % (SNOW_SHOW - FIRST_REAL_SHOW)));
 }

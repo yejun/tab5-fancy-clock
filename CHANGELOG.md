@@ -18,6 +18,10 @@ serial `S` status.
   straight ones.
 - Hour and minute hands (and their shadows) drawn from exact distances, so their tips are evenly round; re-rendered
   only when a hand moves, the CPU use is unchanged.
+- Holiday theme: a winter night with stars, aurora, snowy pines and a snow drift, a gold star at 12, snowflake hour
+  marks and a red bauble hub (`holiday.h`, painted with the static artwork). Shake the Tab5 in this theme and it
+  snows for 20 s (new `snowfall` show, ~15 fps with the second hand running): snow settles on the bezel and the
+  calendar card, then melts.
 - Serial: `R` (PIE checks / stress test, `R c|p` blends in C / on PIE), `S` shows the PIE state, `A 1|3` / `A auto` (force a rotation for testing).
 
 ## 1.1.0 - 2026-10-28

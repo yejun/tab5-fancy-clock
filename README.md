@@ -6,6 +6,8 @@ LVGL 9.x + M5GFX/M5Unified, 1280x720 landscape.
 
 ![Fancy Clock on the Tab5, mid-way through the hourly fireworks](docs/screenshot.png)
 
+![The Holiday theme while it snows: shake the Tab5 to start it](docs/holiday.png)
+
 Requires: Arduino CLI, the `m5stack:esp32` core (3.3.x), and the libraries `lvgl` (9.x), `M5GFX`, `M5Unified`.
 The current code builds with core 3.3.9, LVGL 9.6.0, M5GFX 0.2.33 and M5Unified 0.2.25.
 The Python device tools require `pyserial`; saving PNG screenshots also requires `numpy` and `Pillow` (see `requirements.txt`).
@@ -14,9 +16,16 @@ then `mise run test | flash | device-test`. Without mise: `python3 -m venv .venv
 
 - Analog dial with sweeping second hand (~15 fps), day-progress ring, frosted-glass calendar card, big digital time
   (fixed digit slots, so the digits never shift as the time changes), seconds bar, battery.
-- Five themes (Aurora, Sunset, Ocean, Jade, Graphite): deep tinted backgrounds, saturated-but-soft accents, off-white
+- Six themes (Aurora, Sunset, Ocean, Jade, Graphite, Holiday): deep tinted backgrounds, saturated-but-soft accents, off-white
   "ink" instead of pure white. Fine detail: guilloche sub-dial, sunburst, railway minute track, applied indices with a
   lit edge, translucent lens on the second-hand tip, aurora ribbons and bokeh behind a blurred glass card.
+- **Holiday theme**: a winter night - stars, a green and icy-blue aurora, snowy pines and a snow drift along the
+  bottom (the ones on the right show blurred through the calendar's glass), a gold star at 12 o'clock, snowflakes for
+  the other hour marks and a red glass bauble as the hub. **Shake the Tab5** (one back-and-forth is enough) and it
+  snows for 20 s: flakes at three depths drift down in a slow wind while the clock keeps running, and snow settles
+  on the bezel and along the calendar card's top edge, then melts away. All of the scenery is painted once with the
+  rest of the theme's artwork, so it costs nothing while the clock ticks; the shake is spotted in the accelerometer
+  readings auto-rotation already takes.
 - Touch controls (all remembered across reboots except display on/off):
   - **Drag left/right** anywhere → brightness (right = brighter). A small bar shows the level; minimum ~3% so the screen can't be lost.
   - **Double-tap** → display off (backlight 0; all drawing and automatic WiFi syncs paused, touch, serial and RTC maintenance stay
@@ -29,7 +38,7 @@ then `mise run test | flash | device-test`. Without mise: `python3 -m venv .venv
     a card with level, charging state, voltage (pack and per cell), current, power and a rough time-left /
     time-to-full estimate (2000 mAh pack, smoothed current); refreshed every second. Tap the bottom row to switch the battery display between Auto and USB only;
     other taps close the card. USB-only installations no longer show a phantom full battery. **Tap anywhere else** → next theme
-    (Aurora, Sunset, Ocean, Jade, Graphite). Single taps act after a ~0.35 s pause so they can't be confused with a double-tap.
+    (Aurora, Sunset, Ocean, Jade, Graphite, Holiday). Single taps act after a ~0.35 s pause so they can't be confused with a double-tap.
 
 - **Auto-rotate**: turn the Tab5 upside-down and the picture follows (landscape and landscape upside-down only).
   The new orientation has to be held for 1.2 s, and lying flat, standing on a short side, being moved or a finger on
@@ -90,6 +99,9 @@ How they stay fast:
   those pixels than from PIE.
 - The **dial flip** is limited by memory, not maths: without its shading and blending a frame still takes 33 of its
   46 ms, so it stays in C.
+- **Snowfall** (the Holiday theme's shake, `O 7` by hand; not on the hour) redraws only the 40x40 tiles its 70 flakes
+  pass through - the area behind them, not the flakes, is what costs - and keeps the second hand going: ~15 fps,
+  worst frame ~110 ms. The settled snow is re-rendered only when it has grown or melted by a quarter pixel.
 - Serial: `O` lists the shows, `O <n>` plays one and prints its frame statistics, `O <n> <t>` holds it at t seconds
   (for screenshots), `O x` stops, `O on|off` turns the hourly schedule on or off.
 
@@ -99,6 +111,8 @@ With the display on, the CPU is busy ~18% of the time (it was ~80% at 27 fps bef
   painted per pixel in float (the other themes on core 0 in the background after boot), LVGL draws the crisp details
   on top in 32 bit, then it is dithered (4x4 Bayer) to RGB565.
 - **Composite**: static artwork + day ring + hour/minute hands, re-drawn only where those move (every 3 s / 30 s / 60 s).
+  The hands and their shadows are images computed from exact distances (round tips; LVGL's line caps sit on whole
+  pixels), re-rendered only when a hand moves: ~7 ms for the minute hand every 3 s, no measurable CPU difference.
 - **Per frame** (66 ms) only the second hand, its tip and the hub are drawn on top of the composite, and only inside
   short boxes that follow the hand (not its whole bounding box). Glows are pre-computed sprites, not LVGL box shadows.
 - **Flush**: the rotation into the panel's portrait frame buffer is done by the P4's PPA (DMA), not the CPU, and

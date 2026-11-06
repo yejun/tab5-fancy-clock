@@ -94,6 +94,10 @@
 
 /** Default Dots Per Inch. Used to initialize default sizes such as widgets sized, style paddings.
  * (Not so important, you can adjust it to modify default sizes and spaces.) */
+/** Invalidated areas LVGL keeps per frame before it gives up and redraws the whole screen (default 32); the
+ *  snowfall show redraws many small tiles. */
+#define LV_INV_BUF_SIZE 128
+
 #define LV_DPI_DEF 130              /**< [px/inch] */
 
 /*=================
