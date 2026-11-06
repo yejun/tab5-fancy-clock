@@ -245,6 +245,7 @@ static constexpr int BAR_X = PX + 4, BAR_Y = 334, BAR_W = PW - 110, BAR_H = 8;
 
 static const HandSpec HS_H = {-26, 150, 16, 44, 138, 6};
 static const HandSpec HS_M = {-26, 226, 11, 44, 212, 4};
+static constexpr float HAND_PC = 0.5f;                          // pixel-centre convention of the hand images
 static constexpr float SH_DX = 5, SH_DY = 8;                    // hour/minute hand shadow offset
 static constexpr float S_R0 = -60, S_TAIL = -20, S_R1 = 237;    // second hand: counterweight, then the thin body
 static constexpr float SS_DX = 4, SS_DY = 7;                    // second hand shadow offset
@@ -400,6 +401,116 @@ static void sprite_put(lv_draw_buf_t* b, int x, int y, const Rgba& p) {
   q[1] = (uint8_t)(p.g * 255 + 0.5f);
   q[2] = (uint8_t)(p.r * 255 + 0.5f);
   q[3] = (uint8_t)(p.a * 255 + 0.5f);
+}
+
+// A stack of antialiased capsules (round-ended segments, the first at the bottom) rendered into an ARGB image from
+// exact distances. lv_draw_line puts round caps on whole pixels and rounds the line's width, so its ends come out
+// lumpy - fine for the second hand, which moves every frame, but the hour/minute hands and the night display's
+// outlines change at most every few seconds and are drawn from these.
+
+// `pc`: where a pixel's centre is relative to its index (0: the static artwork's convention, 0.5: LVGL's discs)
+static constexpr int CAPSULE_MAX_W = 400;   // widest box (the minute hand's shadow, level, is ~290)
+static HOT bool capsule_render(CapsuleImg& ci, const Capsule* cs, int n, float pc) {
+  float x1 = 1e9f, y1 = 1e9f, x2 = -1e9f, y2 = -1e9f;
+  for (int i = 0; i < n; i++) {
+    const float r = cs[i].w * 0.5f + 1;
+    x1 = fminf(x1, fminf(cs[i].x0, cs[i].x1) - r); x2 = fmaxf(x2, fmaxf(cs[i].x0, cs[i].x1) + r);
+    y1 = fminf(y1, fminf(cs[i].y0, cs[i].y1) - r); y2 = fmaxf(y2, fmaxf(cs[i].y0, cs[i].y1) + r);
+  }
+  const int bx = (int)floorf(x1 - pc), by = (int)floorf(y1 - pc), bw = (int)ceilf(x2 - pc) - bx + 1, bh = (int)ceilf(y2 - pc) - by + 1;
+  if (!ci.buf || bw > ci.cap || bh > ci.cap) {   // square, so it holds the same stack at most other angles too
+    if (ci.buf) lv_draw_buf_destroy(ci.buf);
+    heap_caps_free(ci.span);
+    ci.cap = max(max(bw, bh), ci.cap);
+    ci.buf = lv_draw_buf_create(ci.cap, ci.cap, LV_COLOR_FORMAT_ARGB8888, 0);
+    ci.span = (int16_t*)heap_caps_malloc(ci.cap * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    ci.rows = 0;
+    if (!ci.buf || !ci.span) { if (ci.buf) lv_draw_buf_destroy(ci.buf); heap_caps_free(ci.span); ci = CapsuleImg(); return false; }
+    lv_draw_buf_clear(ci.buf, nullptr);
+  } else {
+    lv_image_cache_drop(ci.buf);
+  }
+  // Only the pixels the last render touched are cleared and only the ones this one touches are worked on: most of a
+  // slanted hand's box stays empty (in PSRAM, clearing and straightening all of it cost as much as the drawing).
+  const uint32_t stride = ci.buf->header.stride;
+  for (int y = 0; y < ci.rows; y++)
+    if (ci.span[2 * y + 1] >= ci.span[2 * y])
+      memset((uint8_t*)ci.buf->data + y * stride + ci.span[2 * y] * 4, 0, (ci.span[2 * y + 1] - ci.span[2 * y] + 1) * 4);
+  ci.rows = bh;
+  ci.buf->header.w = bw;
+  ci.buf->header.h = bh;
+  ci.area = {bx, by, bx + bw - 1, by + bh - 1};
+  struct Prep { float x0, y0, dx, dy, inv, r, ux, uy, in2, out2, cr, cg, cb, ca; } pr[4];
+  n = min(n, 4);
+  for (int i = 0; i < n; i++) {
+    const Capsule& k = cs[i];
+    Prep& q = pr[i];
+    q.x0 = k.x0; q.y0 = k.y0; q.dx = k.x1 - k.x0; q.dy = k.y1 - k.y0;
+    const float l2 = q.dx * q.dx + q.dy * q.dy, len = sqrtf(l2);
+    q.inv = l2 > 0 ? 1 / l2 : 0;
+    q.ux = len > 0 ? q.dx / len : 0; q.uy = len > 0 ? q.dy / len : 1;
+    q.r = k.w * 0.5f;
+    q.in2 = q.r > 0.5f ? (q.r - 0.5f) * (q.r - 0.5f) : 0;   // fully covered inside this squared distance
+    q.out2 = (q.r + 0.5f) * (q.r + 0.5f);                    // not at all beyond this one
+    q.ca = clamp01(k.opa);
+    q.cr = ((k.col >> 16) & 255) * q.ca; q.cg = ((k.col >> 8) & 255) * q.ca; q.cb = (k.col & 255) * q.ca;   // premultiplied
+  }
+  static float acc[CAPSULE_MAX_W][4];   // one row, premultiplied B G R A, composited here and then written out once
+  if (bw > CAPSULE_MAX_W) return false;
+  for (int y = 0; y < bh; y++) {
+    const float Y = by + y + pc;
+    int xa[4], xb[4], sa = bw, sb = -1;
+    for (int i = 0; i < n; i++) {   // the columns this row can touch: where it crosses each capsule's strip
+      const Prep& q = pr[i];
+      float lo = bx, hi = bx + bw - 1;
+      if (fabsf(q.uy) > 0.25f) {   // (all of the box when nearly level)
+        const float xc = q.x0 + (Y - q.y0) * q.ux / q.uy, half = (q.r + 1) / fabsf(q.uy);
+        lo = fmaxf(lo, fmaxf(xc - half, fminf(q.x0, q.x0 + q.dx) - q.r - 1));
+        hi = fminf(hi, fminf(xc + half, fmaxf(q.x0, q.x0 + q.dx) + q.r + 1));
+      }
+      xa[i] = max(0, (int)floorf(lo - pc) - bx); xb[i] = min(bw - 1, (int)ceilf(hi - pc) - bx);
+      sa = min(sa, xa[i]); sb = max(sb, xb[i]);
+    }
+    ci.span[2 * y] = (int16_t)sa;
+    ci.span[2 * y + 1] = (int16_t)sb;
+    if (sb < sa) continue;
+    memset(acc[sa], 0, (sb - sa + 1) * sizeof(acc[0]));
+    for (int i = 0; i < n; i++) {
+      const Prep& q = pr[i];
+      const float py = Y - q.y0;
+      for (int x = xa[i]; x <= xb[i]; x++) {
+        const float px = bx + x + pc - q.x0, t = clamp01((px * q.dx + py * q.dy) * q.inv);
+        const float ex = px - t * q.dx, ey = py - t * q.dy, d2 = ex * ex + ey * ey;
+        if (d2 >= q.out2) continue;
+        const float cov = d2 <= q.in2 ? 1.0f : clamp01(q.r + 0.5f - sqrtf(d2)), k = 1 - q.ca * cov;
+        float* o = acc[x];
+        o[0] = q.cb * cov + o[0] * k;
+        o[1] = q.cg * cov + o[1] * k;
+        o[2] = q.cr * cov + o[2] * k;
+        o[3] = q.ca * cov + o[3] * k;
+      }
+    }
+    uint8_t* row = (uint8_t*)ci.buf->data + y * stride;
+    for (int x = sa; x <= sb; x++) {   // LVGL wants straight alpha
+      const float* o = acc[x];
+      uint8_t* d = row + x * 4;
+      if (o[3] <= 0.002f) { d[0] = d[1] = d[2] = d[3] = 0; continue; }
+      const float f = 1 / o[3];
+      d[0] = (uint8_t)fminf(255, o[0] * f + 0.5f);
+      d[1] = (uint8_t)fminf(255, o[1] * f + 0.5f);
+      d[2] = (uint8_t)fminf(255, o[2] * f + 0.5f);
+      d[3] = (uint8_t)(o[3] * 255 + 0.5f);
+    }
+  }
+  return true;
+}
+
+static void d_capsules(lv_layer_t* L, const CapsuleImg& ci) {
+  if (!ci.buf || !clip_hit(L, ci.area.x1, ci.area.y1, ci.area.x2, ci.area.y2)) return;
+  lv_draw_image_dsc_t d;
+  lv_draw_image_dsc_init(&d);
+  d.src = ci.buf;
+  lv_draw_image(L, &d, &ci.area);
 }
 
 static HOT void make_sprites(const Theme& th) {
@@ -902,22 +1013,32 @@ static void inv_sprite_path(BoxSink sink, float d0, float d1, float r, float hal
   }
 }
 
-static void draw_hand(lv_layer_t* L, float deg, const HandSpec& h, const Theme& th) {
+// Hour and minute hands and their shadows, as capsule images re-rendered only when a hand moves or the theme changes
+static CapsuleImg g_hand_img[2], g_hand_shadow[2];
+static float g_hand_deg[2] = {NAN, NAN};
+static int g_hand_theme = -1;
+static bool g_hand_soft = false;
+
+static void hand_render(int i, float deg, const HandSpec& h, const Theme& th) {
   const float a = deg * (float)M_PI / 180.0f, s = sinf(a), c = cosf(a);
   const float x0 = CX + s * h.r0, y0 = CY - c * h.r0, x1 = CX + s * h.r1, y1 = CY - c * h.r1;
-  d_line(L, x0, y0, x1, y1, (int)h.w, th.ink, LV_OPA_COVER);
-  // a lighter facet along one side makes the hand read as bevelled metal
-  const float fx = c * (-h.w / 4), fy = s * (-h.w / 4);
-  d_line(L, CX + s * 4 + fx, CY - c * 4 + fy, CX + s * (h.r1 - h.w / 2) + fx, CY - c * (h.r1 - h.w / 2) + fy,
-         (int)(h.w / 2), 0xFFFFFF, 70);
-  d_line(L, CX + s * h.lume0, CY - c * h.lume0, CX + s * h.lume1, CY - c * h.lume1, (int)h.lume_w, th.acc1, 235);
+  const float fx = c * (-h.w / 4), fy = s * (-h.w / 4);   // a lighter facet along one side reads as bevelled metal
+  const Capsule hand[3] = {
+      {x0, y0, x1, y1, h.w, th.ink, 1},
+      {CX + s * 4 + fx, CY - c * 4 + fy, CX + s * (h.r1 - h.w / 2) + fx, CY - c * (h.r1 - h.w / 2) + fy, h.w / 2, 0xFFFFFF, 70 / 255.f},
+      {CX + s * h.lume0, CY - c * h.lume0, CX + s * h.lume1, CY - c * h.lume1, h.lume_w, th.acc1, 235 / 255.f}};
+  capsule_render(g_hand_img[i], hand, 3, HAND_PC);
+  const Capsule shadow[2] = {{x0 + SH_DX, y0 + SH_DY, x1 + SH_DX, y1 + SH_DY, h.w + 8, 0x000000, 30 / 255.f},   // soft penumbra
+                             {x0 + SH_DX, y0 + SH_DY, x1 + SH_DX, y1 + SH_DY, h.w + 1, 0x000000, 60 / 255.f}};  // core
+  capsule_render(g_hand_shadow[i], g_soft_shadows ? shadow : shadow + 1, g_soft_shadows ? 2 : 1, HAND_PC);
 }
 
-static void draw_hand_shadow(lv_layer_t* L, float deg, const HandSpec& h) {
-  const float a = deg * (float)M_PI / 180.0f, s = sinf(a), c = cosf(a);
-  const float x0 = CX + s * h.r0 + SH_DX, y0 = CY - c * h.r0 + SH_DY, x1 = CX + s * h.r1 + SH_DX, y1 = CY - c * h.r1 + SH_DY;
-  if (g_soft_shadows) d_line(L, x0, y0, x1, y1, (int)h.w + 8, 0x000000, 30);   // soft penumbra
-  d_line(L, x0, y0, x1, y1, (int)h.w + 1, 0x000000, 60);   // core
+static void hands_prepare(const Theme& th) {
+  const bool redo = g_hand_theme != g_theme || g_hand_soft != g_soft_shadows;
+  g_hand_theme = g_theme;
+  g_hand_soft = g_soft_shadows;
+  if (redo || g_hand_deg[0] != g_ah) { g_hand_deg[0] = g_ah; hand_render(0, g_ah, HS_H, th); }
+  if (redo || g_hand_deg[1] != g_am) { g_hand_deg[1] = g_am; hand_render(1, g_am, HS_M, th); }
 }
 
 // Everything that lives in the composite, clipped to the layer's current clip area.
@@ -948,11 +1069,11 @@ static void comp_draw(lv_layer_t* L) {
     }
   }
   if (g_show_shadows) {
-    draw_hand_shadow(L, g_ah, HS_H);
-    draw_hand_shadow(L, g_am, HS_M);
+    d_capsules(L, g_hand_shadow[0]);
+    d_capsules(L, g_hand_shadow[1]);
   }
-  draw_hand(L, g_ah, HS_H, th);
-  draw_hand(L, g_am, HS_M, th);
+  d_capsules(L, g_hand_img[0]);
+  d_capsules(L, g_hand_img[1]);
 }
 
 // Re-composite the queued areas (or everything) and invalidate them on screen.
@@ -960,6 +1081,7 @@ static void comp_apply() {
   if (!g_comp_full && !g_comp_n) return;
   if (g_show_owns_dial) return;   // queued until the show hands the dial back
   if (g_merge_regions && !g_comp_full) merge_dirty_regions(g_comp_box, g_comp_n);
+  hands_prepare(THEMES[g_theme]);
   lv_layer_t layer;
   lv_canvas_init_layer(comp_canvas, &layer);
   if (g_comp_full) {

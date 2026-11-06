@@ -90,49 +90,21 @@ static void night_line(lv_layer_t* L, float deg, float r0, float r1, int w, uint
 }
 
 // A hollow capsule (hour mark, hand): a 3 px red wall round a black inside (which hides what it covers, such as the
-// other hand), drawn from its own antialiased ARGB image. Two lv_draw_line calls (red, then a narrower black one) left
-// the ends lumpy: LVGL puts round caps on whole pixels and rounds the line's width, so the black cap didn't sit centred
-// in the red one. The night display is redrawn once a minute, so working the coverage out per pixel costs little.
+// other hand), drawn as a capsule image (see capsule_render) so the black sits centred in the red at the ends too.
 static constexpr int NIGHT_CAPSULES = 14;   // 12 hour marks, 2 hands
-static lv_draw_buf_t* g_night_capsule[NIGHT_CAPSULES];
+static CapsuleImg g_night_capsule[NIGHT_CAPSULES];
 
 static void night_outline(lv_layer_t* L, int slot, float deg, float r0, float r1, float w) {
   const float a = deg * (float)M_PI / 180.0f, s = sinf(a), c = cosf(a);
-  const float x0 = CX + s * r0, y0 = CY - c * r0, dx = s * (r1 - r0), dy = -c * (r1 - r0);
-  const float ro = w * 0.5f, ri = ro - 3, inv = 1.0f / (dx * dx + dy * dy);
-  const int bx = (int)floorf(x0 + fminf(0, dx) - ro - 1), by = (int)floorf(y0 + fminf(0, dy) - ro - 1);
-  const int bw = (int)ceilf(x0 + fmaxf(0, dx) + ro + 1) - bx + 1, bh = (int)ceilf(y0 + fmaxf(0, dy) + ro + 1) - by + 1;
-  if (!clip_hit(L, bx, by, bx + bw - 1, by + bh - 1)) return;
-  lv_draw_buf_t*& b = g_night_capsule[slot];
-  const int side = (int)ceilf(fabsf(r1 - r0) + w) + 6;   // holds the box at any angle
-  if (!b) b = lv_draw_buf_create(side, side, LV_COLOR_FORMAT_ARGB8888, 0);
-  else lv_image_cache_drop(b);
-  if (!b || bw > side || bh > side) return;
-  b->header.w = bw;
-  b->header.h = bh;
-  const float red[3] = {(NIGHT_RED & 255) + 0.5f, ((NIGHT_RED >> 8) & 255) + 0.5f, (NIGHT_RED >> 16) + 0.5f};   // B G R
-  for (int y = 0; y < bh; y++) {
-    uint8_t* row = (uint8_t*)b->data + y * b->header.stride;
-    const float py = by + y + 0.5f - y0;   // pixel centres: LVGL's pixel x spans [x, x+1)
-    for (int x = 0; x < bw; x++) {
-      const float px = bx + x + 0.5f - x0, t = clamp01((px * dx + py * dy) * inv);
-      const float ex = px - t * dx, ey = py - t * dy, d = sqrtf(ex * ex + ey * ey);
-      const float out = clamp01(ro + 0.5f - d), wall = out > 0 ? 1 - clamp01(ri + 0.5f - d) / out : 0;
-      uint8_t* q = row + x * 4;   // LVGL ARGB8888 byte order: B G R A, not premultiplied
-      for (int k = 0; k < 3; k++) q[k] = (uint8_t)(red[k] * wall);
-      q[3] = (uint8_t)(out * 255 + 0.5f);
-    }
-  }
-  lv_draw_image_dsc_t id;
-  lv_draw_image_dsc_init(&id);
-  id.src = b;
-  const lv_area_t area = {bx, by, bx + bw - 1, by + bh - 1};
-  lv_draw_image(L, &id, &area);
+  const float x0 = CX + s * r0, y0 = CY - c * r0, x1 = CX + s * r1, y1 = CY - c * r1, p = w / 2 + 2;
+  if (!clip_hit(L, fminf(x0, x1) - p, fminf(y0, y1) - p, fmaxf(x0, x1) + p, fmaxf(y0, y1) + p)) return;
+  const Capsule cs[2] = {{x0, y0, x1, y1, w, NIGHT_RED, 1}, {x0, y0, x1, y1, w - 6, 0x000000, 1}};
+  if (capsule_render(g_night_capsule[slot], cs, 2, 0.5f)) d_capsules(L, g_night_capsule[slot]);
 }
 
 static void night_text_at(lv_layer_t* L, const char* text, const lv_font_t* font, lv_text_align_t align, int letter_space,
-                          const lv_area_t& a, lv_opa_t opa, bool hollow) {
-  if (!text || !*text || !clip_hit(L, a.x1 - 3, a.y1 - 3, a.x2 + 3, a.y2 + 3)) return;
+                          const lv_area_t& a, lv_opa_t opa) {
+  if (!text || !*text || !clip_hit(L, a.x1, a.y1, a.x2, a.y2)) return;
   lv_draw_label_dsc_t d;
   lv_draw_label_dsc_init(&d);
   d.text = text;
@@ -141,26 +113,100 @@ static void night_text_at(lv_layer_t* L, const char* text, const lv_font_t* font
   d.letter_space = letter_space;
   d.color = lv_color_hex(NIGHT_RED);
   d.opa = opa;
-  if (hollow) {   // outlined glyphs: the text in red shifted round a small circle, then in black on top
-    static const int8_t OFF[8][2] = {{-2, 0}, {2, 0}, {0, -2}, {0, 2}, {-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
-    for (const auto& o : OFF) {
-      lv_area_t b = a;
-      lv_area_move(&b, o[0], o[1]);
-      lv_draw_label(L, &d, &b);
-    }
-    d.color = lv_color_black();
-    d.opa = LV_OPA_COVER;
-  }
   lv_draw_label(L, &d, &a);
 }
 
+// Outlined digits of the big time: each slot's text is drawn once (when it changes) into an image - the glyph's own
+// coverage grown by HOLLOW_R in every direction gives the red outline, the glyph itself stays black inside. Drawing
+// the text in red at 8 offsets instead left the outline 2 px thick on straight strokes but ~1.4 px on slanted ones.
+static constexpr float HOLLOW_R = 2.5f;
+static constexpr int HOLLOW_M = 4;          // margin round the label for the outline
+static lv_obj_t* hollow_canvas = nullptr;   // hidden; only lends its draw layer
+struct Hollow { lv_draw_buf_t* buf = nullptr; char text[4] = ""; lv_area_t at = {}; };
+static Hollow g_hollow[5];
+
+static void hollow_prepare(Hollow& h, lv_obj_t* l) {
+  const char* text = lv_obj_has_flag(l, LV_OBJ_FLAG_HIDDEN) ? "" : lv_label_get_text(l);
+  lv_obj_update_layout(l);
+  lv_area_t a;
+  lv_obj_get_coords(l, &a);
+  const lv_area_t at = {a.x1 - HOLLOW_M, a.y1 - HOLLOW_M, a.x2 + HOLLOW_M, a.y2 + HOLLOW_M};
+  if (h.buf && !strncmp(h.text, text, sizeof(h.text)) && !memcmp(&h.at, &at, sizeof(at))) return;
+  snprintf(h.text, sizeof(h.text), "%s", text);
+  h.at = at;
+  if (!*text) return;
+  const int w = lv_area_get_width(&at), hh = lv_area_get_height(&at);
+  if (!h.buf || (int)h.buf->header.w != w || (int)h.buf->header.h != hh) {
+    if (h.buf) lv_draw_buf_destroy(h.buf);
+    h.buf = lv_draw_buf_create(w, hh, LV_COLOR_FORMAT_ARGB8888, 0);
+    if (!h.buf) return;
+  } else {
+    lv_image_cache_drop(h.buf);
+  }
+  lv_draw_buf_clear(h.buf, nullptr);
+  lv_canvas_set_draw_buf(hollow_canvas, h.buf);
+  lv_layer_t layer;
+  lv_canvas_init_layer(hollow_canvas, &layer);
+  lv_draw_label_dsc_t d;
+  lv_draw_label_dsc_init(&d);
+  d.text = text;
+  d.font = lv_obj_get_style_text_font(l, LV_PART_MAIN);
+  d.align = lv_obj_get_style_text_align(l, LV_PART_MAIN);
+  d.letter_space = lv_obj_get_style_text_letter_space(l, LV_PART_MAIN);
+  d.color = lv_color_white();
+  const lv_area_t inner = {HOLLOW_M, HOLLOW_M, w - 1 - HOLLOW_M, hh - 1 - HOLLOW_M};
+  lv_draw_label(&layer, &d, &inner);
+  lv_canvas_finish_layer(hollow_canvas, &layer);
+
+  // grow the coverage: each pixel takes the strongest glyph pixel nearby, weighted by how far inside the disc it is
+  uint8_t* cov = (uint8_t*)heap_caps_malloc(w * hh, MALLOC_CAP_SPIRAM);
+  if (!cov) { lv_draw_buf_destroy(h.buf); h.buf = nullptr; return; }
+  const uint32_t stride = h.buf->header.stride;
+  for (int y = 0; y < hh; y++)
+    for (int x = 0; x < w; x++) cov[y * w + x] = ((uint8_t*)h.buf->data)[y * stride + x * 4 + 3];
+  struct Off { int8_t dx, dy; uint8_t k; } offs[64];
+  int no = 0;
+  for (int dy = -3; dy <= 3; dy++)
+    for (int dx = -3; dx <= 3; dx++) {
+      const float k = clamp01(HOLLOW_R + 0.5f - sqrtf((float)(dx * dx + dy * dy)));
+      if (k > 0) offs[no++] = {(int8_t)dx, (int8_t)dy, (uint8_t)(k * 255 + 0.5f)};
+    }
+  const uint8_t red[3] = {NIGHT_RED & 255, (NIGHT_RED >> 8) & 255, (NIGHT_RED >> 16) & 255};   // B G R
+  for (int y = 0; y < hh; y++) {
+    uint8_t* row = (uint8_t*)h.buf->data + y * stride;
+    for (int x = 0; x < w; x++) {
+      int out = 0;
+      for (int i = 0; i < no; i++) {
+        const int sx = x + offs[i].dx, sy = y + offs[i].dy;
+        if (sx < 0 || sy < 0 || sx >= w || sy >= hh) continue;
+        const int v = cov[sy * w + sx] * offs[i].k;
+        if (v > out) out = v;
+      }
+      out = (out + 127) / 255;
+      const int g = cov[y * w + x];   // glyph coverage: black on top of the red
+      uint8_t* q = row + x * 4;
+      for (int k = 0; k < 3; k++) q[k] = out ? (uint8_t)(red[k] * (out - g) / out) : 0;
+      q[3] = (uint8_t)out;
+    }
+  }
+  heap_caps_free(cov);
+}
+
+static void hollow_draw(lv_layer_t* L, const Hollow& h) {
+  if (!h.buf || !*h.text || !clip_hit(L, h.at.x1, h.at.y1, h.at.x2, h.at.y2)) return;
+  lv_draw_image_dsc_t d;
+  lv_draw_image_dsc_init(&d);
+  d.src = h.buf;
+  lv_draw_image(L, &d, &h.at);
+}
+
 // One of the clock's own labels, where it is and as it reads, in red (its own opacity scales the red)
-static void night_label(lv_layer_t* L, lv_obj_t* l, bool hollow = false) {
+static void night_label(lv_layer_t* L, lv_obj_t* l) {
   if (!l || lv_obj_has_flag(l, LV_OBJ_FLAG_HIDDEN)) return;
   lv_area_t a;
   lv_obj_get_coords(l, &a);
   night_text_at(L, lv_label_get_text(l), lv_obj_get_style_text_font(l, LV_PART_MAIN), lv_obj_get_style_text_align(l, LV_PART_MAIN),
-                lv_obj_get_style_text_letter_space(l, LV_PART_MAIN), a, hollow ? LV_OPA_COVER : lv_obj_get_style_text_opa(l, LV_PART_MAIN), hollow);
+                lv_obj_get_style_text_letter_space(l, LV_PART_MAIN), a, lv_obj_get_style_text_opa(l, LV_PART_MAIN));
 }
 
 static void night_draw_cb(lv_event_t* e) {
@@ -179,7 +225,7 @@ static void night_draw_cb(lv_event_t* e) {
     const float ang = i * 30.0f * (float)M_PI / 180.0f;
     const int x = (int)(CX + sinf(ang) * 212.0f), y = (int)(CY - cosf(ang) * 212.0f) - lh / 2;
     const lv_area_t a = {x - 50, y, x + 49, y + lh - 1};
-    night_text_at(L, t, f_num, LV_TEXT_ALIGN_CENTER, 0, a, 200, false);
+    night_text_at(L, t, f_num, LV_TEXT_ALIGN_CENTER, 0, a, 200);
   }
   d_arc(L, CX, CY, (int)R_RING + 1, 1, 0, 360, NIGHT_RED, 90);
   if (g_day_m > 0) d_arc(L, CX, CY, (int)R_RING + 2, 3, 270, 270 + g_day_m * 0.25f, NIGHT_RED, LV_OPA_COVER, true);
@@ -194,7 +240,7 @@ static void night_draw_cb(lv_event_t* e) {
   night_label(L, lbl_greet);
   night_label(L, lbl_wifi);
   night_label(L, lbl_batt);
-  for (lv_obj_t* l : lbl_slot) night_label(L, l, true);
+  for (const Hollow& h : g_hollow) hollow_draw(L, h);
   night_label(L, lbl_ampm);
   night_label(L, lbl_date);
 
@@ -222,7 +268,7 @@ static void night_draw_cb(lv_event_t* e) {
     if (lv_obj_get_style_text_opa(l, LV_PART_MAIN) == LV_OPA_COVER) {   // today (dark text on the day mark by day)
       lv_area_t a;
       lv_obj_get_coords(l, &a);
-      night_text_at(L, lv_label_get_text(l), lv_obj_get_style_text_font(l, LV_PART_MAIN), LV_TEXT_ALIGN_CENTER, 0, a, LV_OPA_COVER, false);
+      night_text_at(L, lv_label_get_text(l), lv_obj_get_style_text_font(l, LV_PART_MAIN), LV_TEXT_ALIGN_CENTER, 0, a, LV_OPA_COVER);
     } else {
       night_label(L, l);
     }
@@ -263,6 +309,7 @@ static bool night_tick(const Now& n) {
     if (g_night_key < 0 || key / 60 / 24 != g_night_key / 60 / 24) update_date(n);
     g_night_key = key;
     update_minute(n, false);
+    for (int i = 0; i < 5; i++) hollow_prepare(g_hollow[i], lbl_slot[i]);
     lv_obj_invalidate(night_obj);
   }
   return true;
@@ -331,6 +378,8 @@ static void settings_build() {
   lv_obj_set_style_bg_opa(night_obj, LV_OPA_COVER, 0);
   lv_obj_add_event_cb(night_obj, night_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
   lv_obj_add_flag(night_obj, LV_OBJ_FLAG_HIDDEN);
+  hollow_canvas = lv_canvas_create(lv_layer_bottom());
+  lv_obj_add_flag(hollow_canvas, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void settings_theme() {   // the gear follows the theme like the other header text
