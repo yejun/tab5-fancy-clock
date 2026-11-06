@@ -13,6 +13,8 @@ serial `S` status.
   19 -> 25, fireworks 22-25 -> 25-26; the CPU while the clock ticks 19.4% -> 17.8%.
 - Translucent fills and additive blending on PIE (`lv_blend.c`; LVGL patch adds an additive blend hook), checked
   against C at start-up: numerals 18-19 -> 23 fps, flap 25 -> 27, fireworks 25-26 -> 26-27.
+- Night display: hour marks and hands drawn with even 3 px antialiased outlines and cleanly rounded ends (LVGL's
+  line caps left their ends lumpy); minute ticks 2 px.
 - Serial: `R` (PIE checks / stress test, `R c|p` blends in C / on PIE), `S` shows the PIE state, `A 1|3` / `A auto` (force a rotation for testing).
 
 ## 1.1.0 - 2026-10-28

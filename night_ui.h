@@ -89,10 +89,45 @@ static void night_line(lv_layer_t* L, float deg, float r0, float r1, int w, uint
   d_line(L, CX + s * r0, CY - c * r0, CX + s * r1, CY - c * r1, w, col, opa);
 }
 
-// A hollow capsule: the red shape with a black one 2 px smaller on each side inside it
-static void night_outline(lv_layer_t* L, float deg, float r0, float r1, int w) {
-  night_line(L, deg, r0, r1, w, NIGHT_RED, LV_OPA_COVER);
-  night_line(L, deg, r0, r1, w - 4, 0x000000, LV_OPA_COVER);
+// A hollow capsule (hour mark, hand): a 3 px red wall round a black inside (which hides what it covers, such as the
+// other hand), drawn from its own antialiased ARGB image. Two lv_draw_line calls (red, then a narrower black one) left
+// the ends lumpy: LVGL puts round caps on whole pixels and rounds the line's width, so the black cap didn't sit centred
+// in the red one. The night display is redrawn once a minute, so working the coverage out per pixel costs little.
+static constexpr int NIGHT_CAPSULES = 14;   // 12 hour marks, 2 hands
+static lv_draw_buf_t* g_night_capsule[NIGHT_CAPSULES];
+
+static void night_outline(lv_layer_t* L, int slot, float deg, float r0, float r1, float w) {
+  const float a = deg * (float)M_PI / 180.0f, s = sinf(a), c = cosf(a);
+  const float x0 = CX + s * r0, y0 = CY - c * r0, dx = s * (r1 - r0), dy = -c * (r1 - r0);
+  const float ro = w * 0.5f, ri = ro - 3, inv = 1.0f / (dx * dx + dy * dy);
+  const int bx = (int)floorf(x0 + fminf(0, dx) - ro - 1), by = (int)floorf(y0 + fminf(0, dy) - ro - 1);
+  const int bw = (int)ceilf(x0 + fmaxf(0, dx) + ro + 1) - bx + 1, bh = (int)ceilf(y0 + fmaxf(0, dy) + ro + 1) - by + 1;
+  if (!clip_hit(L, bx, by, bx + bw - 1, by + bh - 1)) return;
+  lv_draw_buf_t*& b = g_night_capsule[slot];
+  const int side = (int)ceilf(fabsf(r1 - r0) + w) + 6;   // holds the box at any angle
+  if (!b) b = lv_draw_buf_create(side, side, LV_COLOR_FORMAT_ARGB8888, 0);
+  else lv_image_cache_drop(b);
+  if (!b || bw > side || bh > side) return;
+  b->header.w = bw;
+  b->header.h = bh;
+  const float red[3] = {(NIGHT_RED & 255) + 0.5f, ((NIGHT_RED >> 8) & 255) + 0.5f, (NIGHT_RED >> 16) + 0.5f};   // B G R
+  for (int y = 0; y < bh; y++) {
+    uint8_t* row = (uint8_t*)b->data + y * b->header.stride;
+    const float py = by + y + 0.5f - y0;   // pixel centres: LVGL's pixel x spans [x, x+1)
+    for (int x = 0; x < bw; x++) {
+      const float px = bx + x + 0.5f - x0, t = clamp01((px * dx + py * dy) * inv);
+      const float ex = px - t * dx, ey = py - t * dy, d = sqrtf(ex * ex + ey * ey);
+      const float out = clamp01(ro + 0.5f - d), wall = out > 0 ? 1 - clamp01(ri + 0.5f - d) / out : 0;
+      uint8_t* q = row + x * 4;   // LVGL ARGB8888 byte order: B G R A, not premultiplied
+      for (int k = 0; k < 3; k++) q[k] = (uint8_t)(red[k] * wall);
+      q[3] = (uint8_t)(out * 255 + 0.5f);
+    }
+  }
+  lv_draw_image_dsc_t id;
+  lv_draw_image_dsc_init(&id);
+  id.src = b;
+  const lv_area_t area = {bx, by, bx + bw - 1, by + bh - 1};
+  lv_draw_image(L, &id, &area);
 }
 
 static void night_text_at(lv_layer_t* L, const char* text, const lv_font_t* font, lv_text_align_t align, int letter_space,
@@ -135,8 +170,8 @@ static void night_draw_cb(lv_event_t* e) {
   // Dial: rim, minute track, indices, numerals, day ring, hands, hub
   d_arc(L, CX, CY, 302, 2, 0, 360, NIGHT_RED, LV_OPA_COVER);
   for (int i = 0; i < 60; i++)
-    if (i % 5) night_line(L, i * 6.0f, 270, 288, 1, NIGHT_RED, 150);
-  for (int i = 0; i < 12; i++) night_outline(L, i * 30.0f, i == 0 ? 243 : 251, 289, 10);
+    if (i % 5) night_line(L, i * 6.0f, 270, 288, 2, NIGHT_RED, 130);
+  for (int i = 0; i < 12; i++) night_outline(L, i, i * 30.0f, i == 0 ? 243 : 251, 289, 10);
   const int lh = lv_font_get_line_height(f_num);
   for (int i = 1; i <= 12; i++) {
     char t[4];
@@ -149,8 +184,8 @@ static void night_draw_cb(lv_event_t* e) {
   d_arc(L, CX, CY, (int)R_RING + 1, 1, 0, 360, NIGHT_RED, 90);
   if (g_day_m > 0) d_arc(L, CX, CY, (int)R_RING + 2, 3, 270, 270 + g_day_m * 0.25f, NIGHT_RED, LV_OPA_COVER, true);
   const float min_f = n.mi + n.s / 60.0f;
-  night_outline(L, ((n.h % 12) + min_f / 60.0f) * 30.0f, HS_H.r0, HS_H.r1, (int)HS_H.w + 4);
-  night_outline(L, min_f * 6.0f, HS_M.r0, HS_M.r1, (int)HS_M.w + 4);
+  night_outline(L, 12, ((n.h % 12) + min_f / 60.0f) * 30.0f, HS_H.r0, HS_H.r1, HS_H.w + 4);
+  night_outline(L, 13, min_f * 6.0f, HS_M.r0, HS_M.r1, HS_M.w + 4);
   d_disc(L, CX, CY, 13, NIGHT_RED, LV_OPA_COVER);
   d_disc(L, CX, CY, 10, 0x000000, LV_OPA_COVER);
   d_disc(L, CX, CY, 3, NIGHT_RED, LV_OPA_COVER);
