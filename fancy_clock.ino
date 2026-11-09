@@ -38,7 +38,7 @@
 // ----------------------------------------------------------------------------------------------
 // Configuration
 // ----------------------------------------------------------------------------------------------
-static constexpr const char* FIRMWARE_VERSION = "1.1.0";   // semantic versioning; see CHANGELOG.md
+static constexpr const char* FIRMWARE_VERSION = "1.2.0";   // semantic versioning; see CHANGELOG.md
 static constexpr int      ROTATION   = 1;    // start-up orientation if the IMU can't tell: 1 = landscape, 3 = upside-down
 static constexpr int      ROT_HOLD_MS = 1200; // auto-rotate: a new orientation must be held this long before the screen turns
 static constexpr uint8_t  BRIGHTNESS = 200;  // 0..255
@@ -62,6 +62,7 @@ static const Theme THEMES[] = {
   {"HOLIDAY",  0x040B1E, 0x0E2A40, 0xFFCC66, 0xFF4D5E, 0x45C99A, 0xF3F7FF, 1},   // snowy pines, star, bauble
 };
 static constexpr int N_THEMES = sizeof(THEMES) / sizeof(THEMES[0]);
+static constexpr int DEFAULT_THEME = 5;   // HOLIDAY, until the user taps to another theme
 
 static const char* const MONTHS[]   = {"January", "February", "March", "April", "May", "June", "July",
                                        "August", "September", "October", "November", "December"};
@@ -219,7 +220,7 @@ static void* alloc_draw_buf(size_t bytes) {
 // ----------------------------------------------------------------------------------------------
 // UI state
 // ----------------------------------------------------------------------------------------------
-static int  g_theme = 0;
+static int  g_theme = DEFAULT_THEME;
 static bool g_24h = true;
 
 static lv_font_t *f_digits, *f_sec, *f_date, *f_head, *f_num, *f_cal, *f_small, *f_tiny;
@@ -2182,7 +2183,7 @@ void setup() {
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
   prefs.begin("clock", false);
-  g_theme = prefs.getInt("theme", 0) % N_THEMES;
+  g_theme = prefs.getInt("theme", DEFAULT_THEME) % N_THEMES;
   g_24h = prefs.getBool("h24", true);
   g_usb_only = prefs.getBool("batt_usb", false);
   g_charge_limit.enabled = prefs.getBool("chg_lim", true);

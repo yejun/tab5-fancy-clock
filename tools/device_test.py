@@ -157,7 +157,7 @@ def main():
             current = status(s)
             original_theme = int(re.search(r"theme=(\d+)", original).group(1))
             current_theme = int(re.search(r"theme=(\d+)", current).group(1))
-            for _ in range((original_theme - current_theme) % 5):
+            for _ in range((original_theme - current_theme) % 6):
                 send(s, "C")
             if ("24h=1" in current) != h24:
                 send(s, "M")

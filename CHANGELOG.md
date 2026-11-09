@@ -3,8 +3,9 @@
 Versions follow [semantic versioning](https://semver.org). The firmware reports its version at boot and in the
 serial `S` status.
 
-## Unreleased
+## 1.2.0 - 2026-11-08
 
+- Holiday is the default theme (a clock that was never switched to another theme starts in it).
 - Aurora show: its per-pixel light on the P4's SIMD unit (PIE, `pie.h`, checked against the C version at start-up),
   and core-0 shows start each frame as soon as the last one is done: aurora 18 -> 31-35 fps.
 - Faster LVGL drawing, same pixels: custom RGB565 blend hooks for translucent fills and sprites (`lv_blend.c`),

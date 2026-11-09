@@ -1,6 +1,6 @@
 # Fancy Clock for M5Stack Tab5
 
-Version 1.1.0 (see `CHANGELOG.md`; the running firmware reports its version at boot and in the `S` status).
+Version 1.2.0 (see `CHANGELOG.md`; the running firmware reports its version at boot and in the `S` status).
 
 LVGL 9.x + M5GFX/M5Unified, 1280x720 landscape.
 
@@ -9,7 +9,7 @@ LVGL 9.x + M5GFX/M5Unified, 1280x720 landscape.
 ![The Holiday theme while it snows: shake the Tab5 to start it](docs/holiday.png)
 
 Requires: Arduino CLI, the `m5stack:esp32` core (3.3.x), and the libraries `lvgl` (9.x), `M5GFX`, `M5Unified`.
-The current code builds with core 3.3.9, LVGL 9.6.0, M5GFX 0.2.33 and M5Unified 0.2.25.
+The current code builds with core 3.3.10, LVGL 9.6.0, M5GFX 0.3.0 and M5Unified 0.2.29.
 The Python device tools require `pyserial`; saving PNG screenshots also requires `numpy` and `Pillow` (see `requirements.txt`).
 With [mise](https://mise.jdx.dev), `mise trust && mise run setup` creates and activates `.venv` in this directory;
 then `mise run test | flash | device-test`. Without mise: `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`.
@@ -19,7 +19,7 @@ then `mise run test | flash | device-test`. Without mise: `python3 -m venv .venv
 - Six themes (Aurora, Sunset, Ocean, Jade, Graphite, Holiday): deep tinted backgrounds, saturated-but-soft accents, off-white
   "ink" instead of pure white. Fine detail: guilloche sub-dial, sunburst, railway minute track, applied indices with a
   lit edge, translucent lens on the second-hand tip, aurora ribbons and bokeh behind a blurred glass card.
-- **Holiday theme**: a winter night - stars, a green and icy-blue aurora, snowy pines and a snow drift along the
+- **Holiday theme** (the default until you tap to another one): a winter night - stars, a green and icy-blue aurora, snowy pines and a snow drift along the
   bottom (the ones on the right show blurred through the calendar's glass), a gold star at 12 o'clock, snowflakes for
   the other hour marks and a red glass bauble as the hub. **Shake the Tab5** (one back-and-forth is enough) and it
   snows for 20 s: flakes at three depths drift down in a slow wind while the clock keeps running, and snow settles
